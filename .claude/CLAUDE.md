@@ -15,17 +15,20 @@ EFREI "Machine Learning for Data Engineers" course project (instructor: Stephany
 ## Model Progression
 
 The instructor explicitly recommends this order — follow it:
-1. Baseline: linear regression, then random forest / gradient boosting (scikit-learn)
-2. Advanced: PyTorch LSTM or Transformer for time-series prediction
+1. ✅ Baseline: Ridge, Random Forest, XGBoost (see `notebooks/03_train_summary.md` for results)
+2. 🚧 Advanced: PyTorch LSTM or Transformer for time-series prediction
 
 Always report metrics (MAE, RMSE, R²) for every model and compare them in a table.
+
+Validation: use Leave-One-Battery-Out (LOBO) CV. Never split train/test by time within a single battery — always hold out complete batteries.
 
 ## Stack
 
 - Data: `pandas`, `numpy`, `scipy`
-- Baselines: `scikit-learn`
-- Deep learning: `PyTorch`
+- Baselines: `scikit-learn`, `xgboost`, `optuna` (hyperparameter tuning)
+- Deep learning: `PyTorch` (pending)
 - Notebooks: Jupyter (exploration) → `.py` scripts (final reproducible pipeline)
+- Package manager: `uv` — always use `uv run`, `uv add`; never `pip` or bare `python3`
 
 ## Project Structure
 
@@ -33,26 +36,30 @@ Always report metrics (MAE, RMSE, R²) for every model and compare them in a tab
 data/          raw and processed datasets (gitignore large files)
 notebooks/     exploratory and analysis notebooks
 src/           reusable Python modules (preprocessing, features, models)
+src/battery.py core loader, feature engineering, RUL computation (362 lines)
 models/        saved model checkpoints
 results/       metrics, plots, evaluation outputs
 ```
 
-## Selected Datasets & Renewable Context
+## Datasets
 
-We will use two complementary datasets from the **NASA Prognostics Data Repository** to model battery degradation. This setup transitions from idealized laboratory environments to realistic, erratic renewable energy profiles.
+NASA PCoE Li-ion battery datasets are already in `data/`. Dataset structure: `@dataset-structure.md`.
 
-Download: 
-- controlled: https://www.nasa.gov/intelligent-systems-division/discovery-and-systems-health/pcoe/pcoe-data-set-repository/
-- randomized: 
+**Retained batteries (13):** Controlled B0005–B0007, B0018; Randomized RW1, RW9, RW13–RW17, RW19–RW20.
 
-The structure of both is detailed in `./dataset-structure.md`.
+**Excluded:** Hot group (43°C, never reach EOL), cold group (4°C, inconsistent mixed load), RW2/RW18 (sensor errors), B0041 (anomalous starting capacity).
 
-## Feature Mapping to the Problem Statement
+## Targets & Modeling Phases
 
-To directly address the project goal of predicting battery **lifespan** and **efficiency** in a green energy context, we map the raw telemetry as follows:
+Two targets:
+- **`rul_frac`** (lifespan): remaining cycles / EOL index, normalised 0–1. EOL = 80% capacity retention.
+- **`energy_retention`** (efficiency): cycle Wh / baseline Wh — captures voltage sag, not just capacity loss.
 
-* **Remaining Useful Life**
-* **Operational Efficiency:** Evaluated by tracking the increase in internal resistance and tracking energy retention loss across sequential cycles (Voltage/Current integration over time).
+Two modeling phases:
+- **Oracle**: controlled batteries only, uses EIS (`Re`, `Rct`) + `r_proxy`
+- **Practical**: controlled + randomized merged, uses `r_proxy` only (field-deployable)
+
+See `@notebooks/02_dataset_prep_summary.md` for feature list and leakage guards.
 
 ## Code Style
 

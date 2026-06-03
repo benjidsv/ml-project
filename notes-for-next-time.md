@@ -1,2 +1,0 @@
-the efficiency task seems to be linear (best performance with ridge, alpha=99)
-investigate efficiency and it's parameters and decide whether to switch to another target, drop it, or keep as linear model
