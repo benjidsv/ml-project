@@ -456,8 +456,8 @@ def run_grouped_cv(
         )
     """
     import torch
-    from sequence import train_model
-    from vg_models import predict_vg
+    from src.sequence import train_model
+    from src.vg_models import predict_vg
 
     split_groups = cv_groups if cv_groups is not None else groups
     n_folds = splitter.get_n_splits(X, groups=split_groups)
