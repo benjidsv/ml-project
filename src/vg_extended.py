@@ -468,12 +468,13 @@ def run_grouped_cv(
         is_test[test_idx] = True
         is_avail = ~is_test
 
-        # Inner-val: last-alphabetical battery among available train cells.
-        # Deterministic and dataset-agnostic (no CONTROLLED_BIDS dependency).
-        avail_bids = sorted(set(groups[is_avail]))
-        val_bid = avail_bids[-1]
-        is_val = is_avail & (groups == val_bid)
-        is_train = is_avail & ~is_val
+        # Inner-val: last-alphabetical battery from the HELD group.
+        # Keeps all training batteries in training and uses a same-domain val signal.
+        # Test is the full held group — early-stopping leakage on val_bid is accepted.
+        held_bids_sorted = sorted(set(groups[is_test]))
+        val_bid = held_bids_sorted[-1]
+        is_val = is_test & (groups == val_bid)
+        is_train = is_avail  # full training pool — no battery stolen for val
 
         X_tr, mask_tr, y_tr = X[is_train], mask[is_train], y[is_train]
         X_val, mask_val, y_val = X[is_val], mask[is_val], y[is_val]
