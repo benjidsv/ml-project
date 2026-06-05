@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 # ── reuse from existing modules (not modified) ───────────────────────────────
-from voltage_grid import (
+from src.voltage_grid import (
     V_LO,
     V_HI,
     N_GRID,
@@ -52,8 +52,8 @@ from voltage_grid import (
     per_fold_loss_curves,
 )
 
-from cells import CELLS, CellSpec
-from extract_generic import (
+from src.cells import CELLS, CellSpec
+from src.extract_generic import (
     extract_timeseries_vg,
     read_calce_cell_dir,
     read_batteryarchive_csv,
@@ -192,7 +192,7 @@ def build_extended_dataset(
         battery_id, cycle_index, tensor (ndarray|None), mask (ndarray|None),
         coverage, cc_dt, cc_slope, capacity_ahr, c_nominal_ah, ds_group
     """
-    from battery import load_controlled, load_randomized
+    from src.battery import load_controlled, load_randomized
 
     specs = cell_specs if cell_specs is not None else CELLS
 

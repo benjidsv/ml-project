@@ -22,7 +22,7 @@ import pandas as pd
 import fastexcel
 from pathlib import Path
 
-from voltage_grid import resample_voltage_grid, V_LO, V_HI, N_GRID
+from src.voltage_grid import resample_voltage_grid, V_LO, V_HI, N_GRID
 
 
 # ---------------------------------------------------------------------------
@@ -31,22 +31,22 @@ from voltage_grid import resample_voltage_grid, V_LO, V_HI, N_GRID
 
 # Standard Arbin BT2000/BT2143 .xls output (CALCE CS2 / CX2)
 CALCE_ARBIN_COLMAP: dict[str, str] = {
-    "cycle_index":       "Cycle_Index",
-    "time_s":            "Test_Time(s)",
-    "current_a":         "Current(A)",
-    "voltage_v":         "Voltage(V)",
-    "discharge_cap_ah":  "Discharge_Capacity(Ah)",
+    "cycle_index": "Cycle_Index",
+    "time_s": "Test_Time(s)",
+    "current_a": "Current(A)",
+    "voltage_v": "Voltage(V)",
+    "discharge_cap_ah": "Discharge_Capacity(Ah)",
     # No temperature column in CALCE — synthesised from ambient_c.
 }
 
 # Standard BatteryArchive *_timeseries.csv
 BATTERYARCHIVE_COLMAP: dict[str, str] = {
-    "cycle_index":       "Cycle_Index",
-    "time_s":            "Test_Time(s)",
-    "current_a":         "Current(A)",
-    "voltage_v":         "Voltage(V)",
-    "temperature_c":     "Cell_Temperature(C)",
-    "discharge_cap_ah":  "Discharge_Capacity(Ah)",
+    "cycle_index": "Cycle_Index",
+    "time_s": "Test_Time(s)",
+    "current_a": "Current(A)",
+    "voltage_v": "Voltage(V)",
+    "temperature_c": "Cell_Temperature(C)",
+    "discharge_cap_ah": "Discharge_Capacity(Ah)",
 }
 
 
@@ -111,8 +111,13 @@ def read_calce_cell_dir(cell_dir: Path, ambient_c: float) -> pd.DataFrame:
         raise FileNotFoundError(f"No .xls/.xlsx files in {cell_dir}")
 
     cm = CALCE_ARBIN_COLMAP
-    needed = [cm["cycle_index"], cm["time_s"], cm["current_a"],
-              cm["voltage_v"], cm["discharge_cap_ah"]]
+    needed = [
+        cm["cycle_index"],
+        cm["time_s"],
+        cm["current_a"],
+        cm["voltage_v"],
+        cm["discharge_cap_ah"],
+    ]
 
     # ------------------------------------------------------------------
     # Pass 1 — load every file and record its start timestamp for sorting
@@ -126,7 +131,11 @@ def read_calce_cell_dir(cell_dir: Path, ambient_c: float) -> pd.DataFrame:
             # fastexcel (Rust/calamine) is ~15× faster than openpyxl for this.
             wb = fastexcel.read_excel(str(f))
             sheet_idx = next(
-                (i for i, s in enumerate(wb.sheet_names) if s.lower().startswith("channel")),
+                (
+                    i
+                    for i, s in enumerate(wb.sheet_names)
+                    if s.lower().startswith("channel")
+                ),
                 1,
             )
             raw = wb.load_sheet_by_idx(sheet_idx).to_pandas()
@@ -144,7 +153,7 @@ def read_calce_cell_dir(cell_dir: Path, ambient_c: float) -> pd.DataFrame:
         # Drop non-numeric rows (some Arbin files embed summary rows mid-sheet)
         raw = raw[pd.to_numeric(raw[cm["cycle_index"]], errors="coerce").notna()].copy()
         raw[cm["cycle_index"]] = raw[cm["cycle_index"]].astype(int)
-        raw[cm["time_s"]]      = raw[cm["time_s"]].astype(float)
+        raw[cm["time_s"]] = raw[cm["time_s"]].astype(float)
 
         ts = _parse_first_datetime(raw, f)
         loaded.append((ts, raw))
@@ -161,15 +170,15 @@ def read_calce_cell_dir(cell_dir: Path, ambient_c: float) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     file_last_cycles: set[int] = set()
     cycle_offset = 0
-    time_offset  = 0.0
+    time_offset = 0.0
 
     for _ts, raw in loaded:
         raw = raw.copy()
         raw[cm["cycle_index"]] += cycle_offset
-        raw[cm["time_s"]]      += time_offset
+        raw[cm["time_s"]] += time_offset
 
         cycle_offset = int(raw[cm["cycle_index"]].max()) + 1
-        time_offset  = float(raw[cm["time_s"]].max()) + 1.0
+        time_offset = float(raw[cm["time_s"]].max()) + 1.0
 
         # Track the last cycle of each file — its discharge capacity is truncated
         # because the test session ended before the discharge completed.
@@ -180,10 +189,10 @@ def read_calce_cell_dir(cell_dir: Path, ambient_c: float) -> pd.DataFrame:
     combined = pd.concat(frames, ignore_index=True)
 
     out = pd.DataFrame({
-        "cycle_index":      combined[cm["cycle_index"]].astype(int),
-        "time_s":           combined[cm["time_s"]].astype(float),
-        "current_a":        combined[cm["current_a"]].astype(float),
-        "voltage_v":        combined[cm["voltage_v"]].astype(float),
+        "cycle_index": combined[cm["cycle_index"]].astype(int),
+        "time_s": combined[cm["time_s"]].astype(float),
+        "current_a": combined[cm["current_a"]].astype(float),
+        "voltage_v": combined[cm["voltage_v"]].astype(float),
         "discharge_cap_ah": combined[cm["discharge_cap_ah"]].astype(float),
     })
     out["temperature_c"] = float(ambient_c)
@@ -211,11 +220,11 @@ def read_batteryarchive_csv(path: Path) -> pd.DataFrame:
         raise ValueError(f"{path.name}: missing columns {missing}")
 
     return pd.DataFrame({
-        "cycle_index":      raw[cm["cycle_index"]].astype(int),
-        "time_s":           raw[cm["time_s"]].astype(float),
-        "current_a":        raw[cm["current_a"]].astype(float),
-        "voltage_v":        raw[cm["voltage_v"]].astype(float),
-        "temperature_c":    raw[cm["temperature_c"]].astype(float),
+        "cycle_index": raw[cm["cycle_index"]].astype(int),
+        "time_s": raw[cm["time_s"]].astype(float),
+        "current_a": raw[cm["current_a"]].astype(float),
+        "voltage_v": raw[cm["voltage_v"]].astype(float),
+        "temperature_c": raw[cm["temperature_c"]].astype(float),
         "discharge_cap_ah": raw[cm["discharge_cap_ah"]].astype(float),
     })
 
@@ -305,8 +314,10 @@ def extract_timeseries_vg(
                 idx = dis_rows.index.to_numpy()
                 run_id = np.concatenate([[0], np.cumsum(np.diff(idx) > 1)])
                 run_caps = [
-                    float(dis_rows.iloc[run_id == r]["discharge_cap_ah"].max()
-                          - dis_rows.iloc[run_id == r]["discharge_cap_ah"].min())
+                    float(
+                        dis_rows.iloc[run_id == r]["discharge_cap_ah"].max()
+                        - dis_rows.iloc[run_id == r]["discharge_cap_ah"].min()
+                    )
                     for r in np.unique(run_id)
                 ]
                 cap_ahr = float(max(run_caps))
@@ -317,7 +328,10 @@ def extract_timeseries_vg(
             # discharge (not a full cycle); above-band = malformed Arbin Cycle_Index
             # that aggregates multiple sub-cycles into one row group.
             if not np.isnan(cap_ahr):
-                if cap_ahr < cap_lo_crate * c_nominal or cap_ahr > cap_hi_crate * c_nominal:
+                if (
+                    cap_ahr < cap_lo_crate * c_nominal
+                    or cap_ahr > cap_hi_crate * c_nominal
+                ):
                     cap_ahr = float("nan")
 
         tensor, mask_arr = None, None
@@ -325,14 +339,19 @@ def extract_timeseries_vg(
 
         charge_rows = grp[grp["current_a"] > 0.0]
         if len(charge_rows) >= 2:
-            V    = charge_rows["voltage_v"].to_numpy(dtype=float)
-            I    = charge_rows["current_a"].to_numpy(dtype=float)   # positive
+            V = charge_rows["voltage_v"].to_numpy(dtype=float)
+            I = charge_rows["current_a"].to_numpy(dtype=float)  # positive
             Temp = charge_rows["temperature_c"].to_numpy(dtype=float)
             Time = charge_rows["time_s"].to_numpy(dtype=float)
 
             tensor, mask_arr, cc_sc = resample_voltage_grid(
-                V, I, Temp, Time,
-                v_lo=v_lo, v_hi=v_hi, n_grid=n_grid,
+                V,
+                I,
+                Temp,
+                Time,
+                v_lo=v_lo,
+                v_hi=v_hi,
+                n_grid=n_grid,
                 i_min=i_min_amps,
                 v_phys_max=v_phys_max,
                 min_pts=min_pts,
@@ -343,10 +362,10 @@ def extract_timeseries_vg(
                 tensor[:, 0] /= c_nominal  # |I| → C-rate
 
         records.append({
-            "battery_id":   bid,
-            "cycle_index":  int(cycle_idx),
-            "tensor":       tensor,
-            "mask":         mask_arr,
+            "battery_id": bid,
+            "cycle_index": int(cycle_idx),
+            "tensor": tensor,
+            "mask": mask_arr,
             "capacity_ahr": cap_ahr,
             **cc_sc,
         })
