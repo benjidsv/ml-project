@@ -241,6 +241,169 @@ class VGCNNLSTM(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Bidirectional GRU
+# ---------------------------------------------------------------------------
+
+
+class VGGRUReg(nn.Module):
+    """Voltage-grid bidirectional GRU regressor.
+
+    Architecture
+    ------------
+    Input (B, L, n_features=3)  →  BiGRU(hidden)  →  masked mean+max pool
+    → Dropout(dropout)  →  Linear(4H [+ n_scalars], 1)
+
+    Mirrors VGLSTMReg but uses GRU (3 gates, no cell state).
+    Default hidden=47 gives ~14.9k params vs LSTM's ~14.6k at hidden=40.
+
+    Scalar injection modes
+    ----------------------
+    "none"       : no scalar features (primary path).
+    "head"       : concatenate s to the pooled rep before the FC layer.
+    "lstm_state" : project s to h0 to prime the BiGRU (no c0 — GRU has none).
+    """
+
+    def __init__(
+        self,
+        n_features: int = 3,
+        hidden: int = 47,
+        dropout: float = 0.35,
+        n_scalars: int = 0,
+        scalar_mode: str = "none",  # "none" | "head" | "lstm_state"
+    ) -> None:
+        super().__init__()
+        if scalar_mode not in {"none", "head", "lstm_state"}:
+            raise ValueError(
+                f"scalar_mode must be 'none', 'head', or 'lstm_state'; got {scalar_mode!r}"
+            )
+
+        self.hidden = hidden
+        self.scalar_mode = scalar_mode
+        self.n_scalars = n_scalars
+
+        self.gru = nn.GRU(
+            n_features,
+            hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.drop = nn.Dropout(dropout)
+
+        if scalar_mode == "lstm_state" and n_scalars > 0:
+            # GRU has no cell state; 2 directions × 1 layer → one h0 vector
+            self.h0_proj = nn.Linear(n_scalars, 2 * hidden)
+
+        head_in = 4 * hidden + (n_scalars if scalar_mode == "head" else 0)
+        self.fc = nn.Linear(head_in, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,  # (B, L, C)
+        mask: torch.Tensor,  # (B, L) bool
+        s: torch.Tensor | None = None,  # (B, n_scalars) optional
+    ) -> torch.Tensor:
+        B, L, _ = x.shape
+
+        h0 = None
+        if self.scalar_mode == "lstm_state" and s is not None:
+            h0 = torch.tanh(self.h0_proj(s)).view(2, B, self.hidden)
+
+        out, _ = self.gru(x, h0)
+        # out: (B, L, 2H)
+
+        pooled = masked_pool(out, mask)  # (B, 4H)
+        pooled = self.drop(pooled)
+
+        if self.scalar_mode == "head" and s is not None:
+            pooled = torch.cat([pooled, s], dim=-1)
+
+        return self.fc(pooled).squeeze(-1)  # (B,)
+
+
+# ---------------------------------------------------------------------------
+# CNN-GRU
+# ---------------------------------------------------------------------------
+
+
+class VGCNNGRU(nn.Module):
+    """CNN front-end + bidirectional GRU for voltage-grid curves.
+
+    Architecture
+    ------------
+    Input (B, L, n_features)
+    → permute (B, n_features, L)
+    → ConvBlock(n_features → cnn_ch, kernel=5)
+    → permute back (B, L, cnn_ch)
+    → BiGRU(hidden)
+    → masked mean+max pool → Dropout → Linear → scalar
+
+    Mirrors VGCNNLSTM with GRU instead of LSTM.
+    Default hidden=47 gives ~16.4k params vs CNN-LSTM's ~16.3k at hidden=40.
+    Same-padding keeps L unchanged so the mask remains valid throughout.
+    """
+
+    def __init__(
+        self,
+        n_features: int = 3,
+        cnn_ch: int = 8,
+        hidden: int = 47,
+        dropout: float = 0.35,
+        n_scalars: int = 0,
+        scalar_mode: str = "none",
+    ) -> None:
+        super().__init__()
+        self.hidden = hidden
+        self.scalar_mode = scalar_mode
+        self.n_scalars = n_scalars
+
+        self.cnn = nn.Sequential(
+            nn.Conv1d(n_features, cnn_ch, kernel_size=5, padding=2),
+            nn.GroupNorm(num_groups=4, num_channels=cnn_ch),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.gru = nn.GRU(
+            cnn_ch,
+            hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.drop = nn.Dropout(dropout)
+
+        if scalar_mode == "lstm_state" and n_scalars > 0:
+            self.h0_proj = nn.Linear(n_scalars, 2 * hidden)
+
+        head_in = 4 * hidden + (n_scalars if scalar_mode == "head" else 0)
+        self.fc = nn.Linear(head_in, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        s: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, L, _ = x.shape
+
+        x = self.cnn(x.transpose(1, 2)).transpose(1, 2)  # (B, L, cnn_ch)
+
+        h0 = None
+        if self.scalar_mode == "lstm_state" and s is not None:
+            h0 = torch.tanh(self.h0_proj(s)).view(2, B, self.hidden)
+
+        out, _ = self.gru(x, h0)
+
+        pooled = masked_pool(out, mask)
+        pooled = self.drop(pooled)
+
+        if self.scalar_mode == "head" and s is not None:
+            pooled = torch.cat([pooled, s], dim=-1)
+
+        return self.fc(pooled).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
 # Inference helper
 # ---------------------------------------------------------------------------
 
