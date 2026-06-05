@@ -797,11 +797,11 @@ def per_fold_scatter_ext(
         ax.plot([lo, hi], [lo, hi], "k--", lw=0.8)
 
         m = fold["metrics"]
-        bids = fold.get("held_bids") or held_g
-        bid_str = ",".join(str(b) for b in bids[:3])
-        if len(bids) > 3:
-            bid_str += "…"
-        ax.set_title(f"{bid_str}\nMAE={m['mae']:.4f}  R²={m['r2']:.3f}", fontsize=7)
+        groups = fold.get("held_group") or fold.get("held_bids") or []
+        group_str = ",".join(str(g) for g in groups[:3])
+        if len(groups) > 3:
+            group_str += "…"
+        ax.set_title(f"{group_str}\nMAE={m['mae']:.4f}  R²={m['r2']:.3f}", fontsize=7)
         ax.set_xlabel("True SOH", fontsize=7)
         ax.set_ylabel("Pred SOH", fontsize=7)
         ax.tick_params(labelsize=7)
@@ -848,11 +848,11 @@ def per_fold_loss_curves_ext(
         if ep and ep > 0:
             ax.axvline(ep, color="gray", lw=0.8, ls="--")
 
-        bids = fold.get("held_bids") or fold.get("held_group") or []
-        bid_str = ",".join(str(b) for b in bids[:2])
-        if len(bids) > 2:
-            bid_str += "…"
-        ax.set_title(f"{bid_str}  (best ep={ep})", fontsize=8)
+        groups = fold.get("held_group") or fold.get("held_bids") or []
+        group_str = ",".join(str(g) for g in groups[:2])
+        if len(groups) > 2:
+            group_str += "…"
+        ax.set_title(f"{group_str}  (best ep={ep})", fontsize=8)
         ax.set_xlabel("Epoch", fontsize=7)
         ax.set_ylabel("L1 loss", fontsize=7)
         ax.tick_params(labelsize=7)
