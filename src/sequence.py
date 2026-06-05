@@ -197,6 +197,7 @@ def train_model(
     S_tr: np.ndarray | None = None,
     S_val: np.ndarray | None = None,
     progress: bool = True,
+    es_window: int = 5,
 ) -> tuple:
     """Train with early stopping on val MSE loss.
 
@@ -213,6 +214,11 @@ def train_model(
         Optional scalar features (e.g. the 9 charge scalars) to pass as the
         third argument to model.forward(x, mask, s).  Must be pre-scaled by
         the caller.  None → model called as forward(x, mask) (original behaviour).
+    es_window : int
+        Patience counter uses a rolling mean of the last es_window val losses
+        instead of the raw single-epoch val.  Prevents a lucky noise trough from
+        being the only thing that resets the counter.  Checkpoint is still saved
+        at the actual best single-epoch val.  Set to 1 to disable.
 
     Returns (model_at_best_val, train_loss_curve, val_loss_curve, best_epoch).
     """
@@ -250,6 +256,7 @@ def train_model(
         )
 
     best_val, best_state, best_ep = float("inf"), None, 0
+    best_smooth = float("inf")
     train_curve, val_curve = [], []
     no_improve = 0
 
@@ -288,10 +295,16 @@ def train_model(
 
         epoch_bar.set_postfix(val=f"{vl:.4f}", best=f"{best_val:.4f}", ep=ep)
 
+        # Checkpoint: raw best single-epoch val (most accurate weights).
         if vl < best_val - 1e-6:
             best_val = vl
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             best_ep = ep
+
+        # Patience: smoothed val so one noisy bad epoch doesn't reset the clock.
+        smooth_val = float(np.mean(val_curve[-es_window:])) if len(val_curve) >= es_window else vl
+        if smooth_val < best_smooth - 1e-6:
+            best_smooth = smooth_val
             no_improve = 0
         else:
             no_improve += 1

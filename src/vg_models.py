@@ -25,6 +25,8 @@ the sequence.train_model / predict_vg training harness.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -153,98 +155,6 @@ class VGLSTMReg(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# CNN-LSTM
-# ---------------------------------------------------------------------------
-
-
-class VGCNNLSTM(nn.Module):
-    """CNN front-end + bidirectional LSTM for voltage-grid curves.
-
-    Architecture
-    ------------
-    Input (B, L, n_features)
-    → permute (B, n_features, L)
-    → ConvBlock(n_features → cnn_ch, kernel=5)
-    → ConvBlock(cnn_ch → cnn_ch, kernel=3)
-    → permute back (B, L, cnn_ch)
-    → BiLSTM(hidden)
-    → masked mean+max pool → Dropout → Linear → scalar
-
-    Same-padding (stride=1) keeps L unchanged, so the mask is valid throughout.
-    """
-
-    def __init__(
-        self,
-        n_features: int = 3,
-        cnn_ch: int = 8,
-        hidden: int = 40,
-        dropout: float = 0.35,
-        n_scalars: int = 0,
-        scalar_mode: str = "none",
-    ) -> None:
-        super().__init__()
-        self.hidden = hidden
-        self.scalar_mode = scalar_mode
-        self.n_scalars = n_scalars
-
-        # GroupNorm stabilises conv output scale regardless of filter initialisation.
-        # Without it, 8 filters × random seed = bimodal results (sometimes great, sometimes catastrophic).
-        # num_groups=4 → 2 channels per group, works for any cnn_ch divisible by 4.
-        self.cnn = nn.Sequential(
-            nn.Conv1d(n_features, cnn_ch, kernel_size=5, padding=2, bias=False),
-            nn.GroupNorm(num_groups=4, num_channels=cnn_ch),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.lstm = nn.LSTM(
-            cnn_ch,
-            hidden,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True,
-        )
-        self.drop = nn.Dropout(dropout)
-
-        if scalar_mode == "lstm_state" and n_scalars > 0:
-            self.h0_proj = nn.Linear(n_scalars, 2 * hidden)
-            self.c0_proj = nn.Linear(n_scalars, 2 * hidden)
-
-        head_in = 4 * hidden + (n_scalars if scalar_mode == "head" else 0)
-        self.fc = nn.Linear(head_in, 1)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
-        s: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        B, L, _ = x.shape
-
-        # CNN front-end: (B, L, C) → (B, C, L) → conv blocks → (B, L, cnn_ch)
-        x = self.cnn(x.transpose(1, 2)).transpose(1, 2)  # (B, L, cnn_ch)
-
-        # Re-zero the padded timesteps before the LSTM ---
-        # mask is (B, L) bool. We unsqueeze to (B, L, 1) and multiply.
-        x = x * mask.unsqueeze(-1).to(x.dtype)
-
-        # Optional LSTM initial state
-        h0, c0 = None, None
-        if self.scalar_mode == "lstm_state" and s is not None:
-            h0 = torch.tanh(self.h0_proj(s)).view(2, B, self.hidden)
-            c0 = torch.tanh(self.c0_proj(s)).view(2, B, self.hidden)
-
-        out, _ = self.lstm(x, (h0, c0) if h0 is not None else None)
-
-        pooled = masked_pool(out, mask)
-        pooled = self.drop(pooled)
-
-        if self.scalar_mode == "head" and s is not None:
-            pooled = torch.cat([pooled, s], dim=-1)
-
-        return self.fc(pooled).squeeze(-1)
-
-
-# ---------------------------------------------------------------------------
 # Bidirectional GRU
 # ---------------------------------------------------------------------------
 
@@ -324,6 +234,122 @@ class VGGRUReg(nn.Module):
 
         return self.fc(pooled).squeeze(-1)  # (B,)
 
+# ---------------------------------------------------------------------------
+# CNN Feature Extractor (to pair with LSTM or GRU)
+# ---------------------------------------------------------------------------
+
+
+class ConvBlock(nn.Module):
+    """Simple Conv1d block: Conv → GroupNorm → ReLU → Dropout."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
+        self.norm = nn.GroupNorm(num_groups=4, num_channels=out_ch)
+        self.act = nn.ReLU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.drop(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# CNN-LSTM
+# ---------------------------------------------------------------------------
+
+
+class VGCNNLSTM(nn.Module):
+    """CNN front-end + bidirectional LSTM for voltage-grid curves.
+
+    Architecture
+    ------------
+    Input (B, L, n_features)
+    → permute (B, n_features, L)
+    → ConvBlock(n_features → cnn_ch, kernel=5)
+    → ConvBlock(cnn_ch → cnn_ch, kernel=3)
+    → permute back (B, L, cnn_ch)
+    → BiLSTM(hidden)
+    → masked mean+max pool → Dropout → Linear → scalar
+
+    Same-padding (stride=1) keeps L unchanged, so the mask is valid throughout.
+    """
+
+    def __init__(
+        self,
+        n_features: int = 3,
+        cnn_ch: int = 16,
+        hidden: int = 40,
+        dropout: float = 0.35,
+        cnn_dropout: float = 0.1,
+        n_scalars: int = 0,
+        scalar_mode: str = "none",
+    ) -> None:
+        super().__init__()
+        self.hidden = hidden
+        self.scalar_mode = scalar_mode
+        self.n_scalars = n_scalars
+
+        # GroupNorm stabilises conv output scale regardless of filter initialisation.
+        # Without it, 8 filters × random seed = bimodal results (sometimes great, sometimes catastrophic).
+        # num_groups=4 → 2 channels per group, works for any cnn_ch divisible by 4.
+        self.cnn = ConvBlock(n_features, cnn_ch, kernel_size=5, dropout=cnn_dropout)
+        self.lstm = nn.LSTM(
+            cnn_ch,
+            hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.drop = nn.Dropout(dropout)
+
+        if scalar_mode == "lstm_state" and n_scalars > 0:
+            self.h0_proj = nn.Linear(n_scalars, 2 * hidden)
+            self.c0_proj = nn.Linear(n_scalars, 2 * hidden)
+
+        head_in = 4 * hidden + (n_scalars if scalar_mode == "head" else 0)
+        self.fc = nn.Linear(head_in, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        s: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, L, _ = x.shape
+
+        # CNN front-end: (B, L, C) → (B, C, L) → conv blocks → (B, L, cnn_ch)
+        x = self.cnn(x.transpose(1, 2)).transpose(1, 2)  # (B, L, cnn_ch)
+
+        # Re-zero the padded timesteps before the LSTM ---
+        # mask is (B, L) bool. We unsqueeze to (B, L, 1) and multiply.
+        x = x * mask.unsqueeze(-1).to(x.dtype)
+
+        # Optional LSTM initial state
+        h0, c0 = None, None
+        if self.scalar_mode == "lstm_state" and s is not None:
+            h0 = torch.tanh(self.h0_proj(s)).view(2, B, self.hidden)
+            c0 = torch.tanh(self.c0_proj(s)).view(2, B, self.hidden)
+
+        out, _ = self.lstm(x, (h0, c0) if h0 is not None else None)
+
+        pooled = masked_pool(out, mask)
+        pooled = self.drop(pooled)
+
+        if self.scalar_mode == "head" and s is not None:
+            pooled = torch.cat([pooled, s], dim=-1)
+
+        return self.fc(pooled).squeeze(-1)
+
 
 # ---------------------------------------------------------------------------
 # CNN-GRU
@@ -350,9 +376,10 @@ class VGCNNGRU(nn.Module):
     def __init__(
         self,
         n_features: int = 3,
-        cnn_ch: int = 8,
+        cnn_ch: int = 16,
         hidden: int = 47,
         dropout: float = 0.35,
+        cnn_dropout: float = 0.1,
         n_scalars: int = 0,
         scalar_mode: str = "none",
     ) -> None:
@@ -361,12 +388,7 @@ class VGCNNGRU(nn.Module):
         self.scalar_mode = scalar_mode
         self.n_scalars = n_scalars
 
-        self.cnn = nn.Sequential(
-            nn.Conv1d(n_features, cnn_ch, kernel_size=5, padding=2),
-            nn.GroupNorm(num_groups=4, num_channels=cnn_ch),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
+        self.cnn = ConvBlock(n_features, cnn_ch, kernel_size=5, dropout=cnn_dropout)
         self.gru = nn.GRU(
             cnn_ch,
             hidden,
@@ -405,6 +427,167 @@ class VGCNNGRU(nn.Module):
             pooled = torch.cat([pooled, s], dim=-1)
 
         return self.fc(pooled).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# BiGRU + attention pooling
+# ---------------------------------------------------------------------------
+
+
+class VGAttnGRUReg(nn.Module):
+    """Bidirectional GRU with single-head attention pooling.
+
+    Architecture
+    ------------
+    Input (B, L, n_features)  →  BiGRU(hidden)  →  attention pooling (B, 2H)
+    → Dropout  →  Linear(2H, 1)
+
+    Attention replaces the masked mean+max pool of VGGRUReg.  A learned linear
+    layer scores each timestep; pad positions are masked to -1e9 before softmax
+    so they never contribute to the pooled representation.
+
+    Parameter count is identical to VGGRUReg at the same hidden size:
+    mean+max uses Linear(4H,1) = 4H+1 params; attention uses Linear(2H,1,bias=False)
+    + Linear(2H,1) = 2H + 2H+1 = 4H+1 params.
+    """
+
+    def __init__(
+        self,
+        n_features: int = 3,
+        hidden: int = 47,
+        dropout: float = 0.35,
+        n_scalars: int = 0,
+        scalar_mode: str = "none",
+    ) -> None:
+        super().__init__()
+        if scalar_mode not in {"none", "head", "lstm_state"}:
+            raise ValueError(
+                f"scalar_mode must be 'none', 'head', or 'lstm_state'; got {scalar_mode!r}"
+            )
+        self.hidden = hidden
+        self.scalar_mode = scalar_mode
+        self.n_scalars = n_scalars
+
+        self.gru = nn.GRU(
+            n_features,
+            hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.attn = nn.Linear(2 * hidden, 1, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+        if scalar_mode == "lstm_state" and n_scalars > 0:
+            self.h0_proj = nn.Linear(n_scalars, 2 * hidden)
+
+        head_in = 2 * hidden + (n_scalars if scalar_mode == "head" else 0)
+        self.fc = nn.Linear(head_in, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        s: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, L, _ = x.shape
+
+        h0 = None
+        if self.scalar_mode == "lstm_state" and s is not None:
+            h0 = torch.tanh(self.h0_proj(s)).view(2, B, self.hidden)
+
+        out, _ = self.gru(x, h0)  # (B, L, 2H)
+
+        # Attention pooling: score → mask pads → softmax → weighted sum
+        scores = self.attn(out)  # (B, L, 1)
+        scores = scores + (~mask.unsqueeze(-1)) * (-1e9)
+        weights = torch.softmax(scores, dim=1)  # (B, L, 1)
+        pooled = (out * weights).sum(dim=1)     # (B, 2H)
+
+        pooled = self.drop(pooled)
+
+        if self.scalar_mode == "head" and s is not None:
+            pooled = torch.cat([pooled, s], dim=-1)
+
+        return self.fc(pooled).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# Transformer encoder
+# ---------------------------------------------------------------------------
+
+
+class VGTransformerReg(nn.Module):
+    """Voltage-grid Transformer encoder regressor.
+
+    Architecture
+    ------------
+    Input (B, L, n_features)
+    → Linear(n_features → d_model)
+    → sinusoidal positional encoding (fixed)
+    → TransformerEncoder (num_layers × nhead)
+    → masked mean+max pool  → (B, 2*d_model)
+    → Dropout  → Linear(2*d_model, 1)
+
+    key_padding_mask is derived by inverting the validity mask so that
+    pad positions (mask=False) are ignored by the attention mechanism.
+
+    Default d_model=32, nhead=4, dim_feedforward=64, num_layers=2 gives ~17k
+    params — comparable to VGCNNGRU (~16k) and VGCNNLSTM (~16k).
+    """
+
+    def __init__(
+        self,
+        n_features: int = 3,
+        d_model: int = 32,
+        nhead: int = 4,
+        dim_feedforward: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.35,
+        max_len: int = 256,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+        self.input_proj = nn.Linear(n_features, d_model)
+
+        # Fixed sinusoidal positional encoding — not learned
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[: d_model // 2])
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.drop = nn.Dropout(dropout)
+        self.fc = nn.Linear(2 * d_model, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,    # (B, L, n_features)
+        mask: torch.Tensor, # (B, L) bool — True = valid timestep
+        s: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, L, _ = x.shape
+
+        x = self.input_proj(x) + self.pe[:, :L, :]  # (B, L, d_model)
+
+        # PyTorch key_padding_mask: True = ignore (pad) → invert our validity mask
+        out = self.encoder(x, src_key_padding_mask=~mask)  # (B, L, d_model)
+
+        pooled = masked_pool(out, mask)   # (B, 2*d_model)
+        pooled = self.drop(pooled)
+        return self.fc(pooled).squeeze(-1)  # (B,)
 
 
 # ---------------------------------------------------------------------------
