@@ -365,6 +365,281 @@ RANDOMIZED_MATS: dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# CC+CV slice with time channel (nb08)
+# ---------------------------------------------------------------------------
+
+
+def slice_resample_windowed(
+    V: np.ndarray,
+    I: np.ndarray,
+    T: np.ndarray,
+    Time: np.ndarray,
+    v_cv: float,
+    i_cut: float,
+    n_points: int,
+    v_start: float | None = None,
+    i_min: float = 1.0,
+    v_phys_max: float = 4.3,
+    min_pts: int = 10,
+) -> tuple[np.ndarray | None, dict]:
+    """Extract CC+CV (or CV-only) charge segment with a 4-channel tensor.
+
+    Channels: [V, |I|, T, t_elapsed_s]
+    Channel 4 = real elapsed seconds from segment start (restores duration).
+
+    Parameters
+    ----------
+    v_start : float | None
+        Anchor voltage for CC-ramp start.  None → CV-only (start at v_cv,
+        D1 mode).  Float → start at first upward crossing of v_start (D2
+        mode); falls back to v_cv if the charge began above the anchor.
+
+    Returns
+    -------
+    (tensor (n_points, 4) float32 or None, cc_scalars dict)
+    cc_scalars keys: 'cc_dt_anchor_to_cv' (s), 'cc_slope' (V/s).
+    Both are 0.0 when no CC ramp is captured (v_start=None or fallback).
+    """
+    V = np.asarray(V, dtype=float)
+    I = np.asarray(I, dtype=float)
+    T = np.asarray(T, dtype=float)
+    Time = np.asarray(Time, dtype=float)
+    _empty = {"cc_dt_anchor_to_cv": 0.0, "cc_slope": 0.0}
+
+    if np.nanmax(V) > v_phys_max:
+        return None, _empty
+
+    # CV onset (two-consecutive-sample rule, same as slice_resample)
+    above_cv = np.where(V >= v_cv)[0]
+    if len(above_cv) == 0:
+        return None, _empty
+    i_cv = None
+    for k in above_cv:
+        if k + 1 < len(V) and V[k + 1] >= v_cv:
+            i_cv = int(k)
+            break
+    if i_cv is None:
+        return None, _empty
+
+    cc_dt = 0.0
+    cc_slope = 0.0
+
+    if v_start is None:
+        # D1 mode: CV-only with time channel
+        i_start = i_cv
+    elif V[0] >= v_start:
+        # Charge began above anchor — no CC ramp to capture
+        i_start = i_cv
+    else:
+        # D2 mode: find first upward crossing of v_start (two-consecutive rule)
+        above_vs = np.where(V >= v_start)[0]
+        i_anchor = None
+        for k in above_vs:
+            if k + 1 < len(V) and V[k + 1] >= v_start:
+                i_anchor = int(k)
+                break
+        if i_anchor is None or i_anchor >= i_cv:
+            i_start = i_cv  # fall back to CV onset
+        else:
+            i_start = i_anchor
+            dt = float(Time[i_cv] - Time[i_anchor])
+            cc_dt = max(0.0, dt)
+            if cc_dt > 0.0:
+                cc_slope = float((V[i_cv] - V[i_anchor]) / cc_dt)
+
+    # End: last sample from i_start where |I| >= i_cut (unchanged logic)
+    abs_I_seg = np.abs(I[i_start:])
+    above_cut = np.where(abs_I_seg >= i_cut)[0]
+    if len(above_cut) == 0:
+        return None, {"cc_dt_anchor_to_cv": cc_dt, "cc_slope": cc_slope}
+    i_end = i_start + int(above_cut[-1])
+    if i_end <= i_start:
+        return None, {"cc_dt_anchor_to_cv": cc_dt, "cc_slope": cc_slope}
+
+    seg_V = V[i_start: i_end + 1]
+    seg_I = I[i_start: i_end + 1]
+    seg_T = T[i_start: i_end + 1]
+    seg_time = Time[i_start: i_end + 1]
+
+    if np.abs(seg_I).max() < i_min or len(seg_V) < min_pts:
+        return None, {"cc_dt_anchor_to_cv": cc_dt, "cc_slope": cc_slope}
+
+    abs_I = np.abs(seg_I)
+    t_elapsed = seg_time - seg_time[0]  # seconds from segment start
+
+    old_idx = np.linspace(0, len(seg_V) - 1, len(seg_V))
+    new_idx = np.linspace(0, len(seg_V) - 1, n_points)
+    r_V  = np.interp(new_idx, old_idx, seg_V)
+    r_I  = np.interp(new_idx, old_idx, abs_I)
+    r_T  = np.interp(new_idx, old_idx, seg_T)
+    r_te = np.interp(new_idx, old_idx, t_elapsed)
+
+    tensor = np.stack([r_V, r_I, r_T, r_te], axis=-1).astype(np.float32)
+    return tensor, {"cc_dt_anchor_to_cv": cc_dt, "cc_slope": cc_slope}
+
+
+def extract_controlled_cc(
+    cycles: list[dict],
+    battery_id: str,
+    v_cv: float,
+    i_cut: float,
+    n_points: int,
+    v_start: float | None = None,
+    i_min: float = 1.0,
+    v_phys_max: float = 4.3,
+    min_pts: int = 10,
+) -> list[dict]:
+    """Like extract_controlled but calls slice_resample_windowed (4-channel tensor).
+
+    Returned dicts: battery_id, cycle_index, tensor (n_points,4)|None,
+    cc_dt_anchor_to_cv, cc_slope.
+    """
+    pairs: list[tuple[dict, dict | None]] = []
+    last_charge: dict | None = None
+    for cycle in cycles:
+        ctype = str(cycle.get("type", ""))
+        if ctype == "charge":
+            last_charge = cycle
+        elif ctype == "discharge":
+            pairs.append((cycle, last_charge))
+
+    if not pairs:
+        return []
+
+    cap_vals = []
+    for dis, _ in pairs:
+        d = dis["data"]
+        time = np.asarray(d["Time"], dtype=float)
+        current = np.asarray(d["Current_measured"], dtype=float)
+        cap_vals.append(float(np.trapezoid(np.abs(current), time) / 3600))
+
+    n_warmup = max(5, int(0.10 * len(pairs)))
+    baseline = max(cap_vals[:n_warmup])
+    kept = [(dis, chg) for (dis, chg), cap in zip(pairs, cap_vals) if cap > 0.5 * baseline]
+
+    if not kept:
+        return []
+
+    records = []
+    for new_idx, (dis, chg) in enumerate(kept):
+        tensor, cc_sc = None, {"cc_dt_anchor_to_cv": 0.0, "cc_slope": 0.0}
+        if chg is not None:
+            d = chg["data"]
+            V    = np.asarray(d["Voltage_measured"], dtype=float)
+            I    = np.asarray(d["Current_measured"], dtype=float)
+            Temp = np.asarray(d["Temperature_measured"], dtype=float)
+            TT   = np.asarray(d["Time"], dtype=float)
+            tensor, cc_sc = slice_resample_windowed(
+                V, I, Temp, TT, v_cv, i_cut, n_points,
+                v_start=v_start, i_min=i_min, v_phys_max=v_phys_max, min_pts=min_pts,
+            )
+        records.append({
+            "battery_id": battery_id,
+            "cycle_index": new_idx,
+            "tensor": tensor,
+            **cc_sc,
+        })
+    return records
+
+
+def extract_randomized_cc(
+    steps: list[dict],
+    battery_id: str,
+    v_cv: float,
+    i_cut: float,
+    n_points: int,
+    v_start: float | None = None,
+    i_min: float = 1.0,
+    v_phys_max: float = 4.3,
+    min_pts: int = 10,
+) -> list[dict]:
+    """Like extract_randomized but calls slice_resample_windowed (4-channel tensor)."""
+    raw_pairs: list[tuple[dict, dict | None]] = []
+    last_ref_charge: dict | None = None
+
+    for step in steps:
+        stype   = str(step.get("type", "")).upper()
+        comment = str(step.get("comment", "")).lower()
+        is_ref  = "reference" in comment
+
+        if stype == "C" and is_ref:
+            last_ref_charge = step
+        elif stype == "D" and is_ref:
+            time    = np.asarray(step["relativeTime"], dtype=float)
+            current = np.asarray(step["current"], dtype=float)
+            if len(time) < 2 or np.abs(current).mean() < 0.5:
+                continue
+            if float(time[-1] - time[0]) < 1200:
+                continue
+            raw_pairs.append((step, last_ref_charge))
+
+    if not raw_pairs:
+        return []
+
+    decimated = raw_pairs[::2]
+    records = []
+    for new_idx, (dis, chg) in enumerate(decimated):
+        tensor, cc_sc = None, {"cc_dt_anchor_to_cv": 0.0, "cc_slope": 0.0}
+        if chg is not None:
+            V    = np.asarray(chg["voltage"], dtype=float)
+            I    = np.asarray(chg["current"], dtype=float)
+            Temp = np.asarray(chg["temperature"], dtype=float)
+            TT   = np.asarray(chg["relativeTime"], dtype=float)
+            tensor, cc_sc = slice_resample_windowed(
+                V, I, Temp, TT, v_cv, i_cut, n_points,
+                v_start=v_start, i_min=i_min, v_phys_max=v_phys_max, min_pts=min_pts,
+            )
+        records.append({
+            "battery_id": battery_id,
+            "cycle_index": new_idx,
+            "tensor": tensor,
+            **cc_sc,
+        })
+    return records
+
+
+def build_dataset_cc(
+    project_root: Path,
+    v_cv: float,
+    i_cut: float,
+    n_points: int,
+    v_start: float | None = None,
+    i_min: float = 1.0,
+    v_phys_max: float = 4.3,
+    min_pts: int = 10,
+) -> pd.DataFrame:
+    """Extract 4-channel charge-curve tensors for all 13 retained batteries.
+
+    v_start=None → CV-only + time (D1).
+    v_start=float → anchored CC+CV + time (D2 / headline).
+
+    Returns DataFrame: battery_id, cycle_index, tensor (or None),
+    cc_dt_anchor_to_cv, cc_slope.
+    """
+    all_records: list[dict] = []
+
+    for bid, rel_path in CONTROLLED_MATS.items():
+        path = project_root / rel_path
+        cycles = load_controlled(path)
+        records = extract_controlled_cc(cycles, bid, v_cv, i_cut, n_points,
+                                        v_start=v_start, i_min=i_min,
+                                        v_phys_max=v_phys_max, min_pts=min_pts)
+        all_records.extend(records)
+        print(f"  {bid}: {len(records)} cycles")
+
+    for bid, rel_path in RANDOMIZED_MATS.items():
+        path = project_root / rel_path
+        steps = load_randomized(path)
+        records = extract_randomized_cc(steps, bid, v_cv, i_cut, n_points,
+                                        v_start=v_start, i_min=i_min,
+                                        v_phys_max=v_phys_max, min_pts=min_pts)
+        all_records.extend(records)
+        print(f"  {bid}: {len(records)} cycles")
+
+    return pd.DataFrame(all_records)
+
+
 def build_dataset(
     project_root: Path,
     v_cv: float,

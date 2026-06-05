@@ -230,44 +230,89 @@ class TCNRegPooled(nn.Module):
 
 
 class LSTMRegPooled(nn.Module):
-    """Bidirectional LSTM with mean+max pooling over all timesteps.
+    """Bidirectional LSTM with mean+max+final pooling and scalar context injection.
 
-    For within-cycle charge curves the full 128-step sequence is available,
-    so there is no causal constraint.  Two improvements over the last-hidden-
-    state LSTM in sequence.py:
+    Architecture
+    ------------
+    When scalars are provided, they are used in two ways:
+      1. **Initial state**: a learned projection primes (h₀, c₀) so the LSTM
+         processes the curve already knowing the battery's stress context.
+      2. **Head**: scalars are also concatenated to the pooled rep before the
+         final FC, preserving the direct prediction path.
 
-    1. Bidirectional: forward arm sees rising voltage → cutoff knee;
-       backward arm reads cutoff → start, emphasising different shape features.
-    2. Pool all L hidden states instead of only the last:
-         [mean(all), max(all), h_fwd_final, h_bwd_final] → 6*H → FC(1)
+    Pooling: [mean(all), max(all), h_fwd_last, h_bwd_last] → 6H → FC(1)
+    Final states: h[-2] (last layer fwd) and h[-1] (last layer bwd).
+    With num_layers=1 this reduces to h[0], h[1] — same as before.
 
     Parameters
     ----------
+    num_layers : int
+        Number of stacked LSTM layers.  Dropout is applied between layers
+        when num_layers > 1.
     n_scalars : int
-        Optional scalar features concatenated before the head (same hybrid
-        pattern as CNNReg / TCNRegPooled).
+        Number of scalar features.  When > 0, scalars are injected as the
+        LSTM's initial hidden/cell state AND concatenated in the head.
     """
 
     def __init__(
         self,
         n_features: int,
-        hidden: int = 64,
+        hidden: int = 96,
         dropout: float = 0.25,
         n_scalars: int = 0,
+        num_layers: int = 2,
     ):
         super().__init__()
-        self.lstm = nn.LSTM(n_features, hidden, batch_first=True, bidirectional=True)
+        self.hidden = hidden
+        self.num_layers = num_layers
+        self.n_scalars = n_scalars
+
+        self.lstm = nn.LSTM(
+            n_features,
+            hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
         self.drop = nn.Dropout(dropout)
-        # mean(2H) + max(2H) + [h_fwd, h_bwd](2H) = 6H
+
+        # Initial-state projections (only built when scalars are present)
+        if n_scalars > 0:
+            init_dim = num_layers * 2 * hidden  # (num_layers × directions × H)
+            self.h0_proj = nn.Linear(n_scalars, init_dim)
+            self.c0_proj = nn.Linear(n_scalars, init_dim)
+
+        # mean(2H) + max(2H) + final(2H) = 6H; scalars also kept in head
         self.fc = nn.Linear(6 * hidden + n_scalars, 1)
 
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor, s: torch.Tensor | None = None
     ) -> torch.Tensor:
-        out, (h, _) = self.lstm(x)  # out:(B,L,2H)  h:(2,B,H)
+        B = x.size(0)
+        init = None
+        if s is not None and self.n_scalars > 0:
+            # h0/c0: (num_layers*2, B, H)
+            h0 = (
+                torch
+                .tanh(self.h0_proj(s))
+                .view(B, self.num_layers * 2, self.hidden)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            c0 = (
+                torch
+                .tanh(self.c0_proj(s))
+                .view(B, self.num_layers * 2, self.hidden)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            init = (h0, c0)
+
+        out, (h, _) = self.lstm(x, init)  # out:(B,L,2H)  h:(num_layers*2,B,H)
         mean_pool = out.mean(dim=1)  # (B, 2H)
         max_pool = out.max(dim=1).values  # (B, 2H)
-        final = torch.cat([h[0], h[1]], dim=-1)  # (B, 2H)
+        final = torch.cat([h[-2], h[-1]], dim=-1)  # (B, 2H) — last layer only
         rep = self.drop(torch.cat([mean_pool, max_pool, final], dim=-1))  # (B, 6H)
         if s is not None:
             rep = torch.cat([rep, s], dim=-1)

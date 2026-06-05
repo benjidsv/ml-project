@@ -1,5 +1,11 @@
 # Within-Cycle Data Prep Summary — `05_dataset_prep_dl.ipynb`
 
+> **⚠️ SUPERSEDED** — This summary describes an earlier design iteration and is no longer
+> accurate. See [`../extended-dataset/00_pipeline_and_data.md`](../extended-dataset/00_pipeline_and_data.md)
+> for the current design. Key differences: voltage window is **3.8–4.2 V** (not 4.1 V);
+> channels are **`[|I|, T, t_elapsed]`** (not `[V, I, T]`); target is **`Ct/C_nominal`**
+> (not `capacity_retention`).
+
 ## What we did
 
 Extracted the **CC charge-curve tensors** (V, I, T) preceding each retained discharge cycle from
