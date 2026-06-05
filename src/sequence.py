@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
 
@@ -217,9 +216,11 @@ def train_model(
 
     Returns (model_at_best_val, train_loss_curve, val_loss_curve, best_epoch).
     """
-    Xt = torch.tensor(X_tr, dtype=torch.float32)
-    mt = torch.tensor(mask_tr, dtype=torch.bool)
-    yt = torch.tensor(y_tr, dtype=torch.float32)
+    # Pre-move the full train set to device once; index on-device per batch.
+    # Eliminates N_batches × N_epochs × N_folds CPU→device transfers (the main bottleneck on MPS).
+    Xt = torch.tensor(X_tr, dtype=torch.float32).to(device)
+    mt = torch.tensor(mask_tr, dtype=torch.bool).to(device)
+    yt = torch.tensor(y_tr, dtype=torch.float32).to(device)
     Xv = torch.tensor(X_val, dtype=torch.float32).to(device)
     mv = torch.tensor(mask_val, dtype=torch.bool).to(device)
     yv = torch.tensor(y_val, dtype=torch.float32).to(device)
@@ -228,17 +229,12 @@ def train_model(
         if S_val is not None
         else None
     )
-
-    use_scalars = S_tr is not None
-    if use_scalars:
-        St = torch.tensor(S_tr, dtype=torch.float32)
-        loader = DataLoader(
-            TensorDataset(Xt, mt, yt, St), batch_size=batch_size, shuffle=True
-        )
-    else:
-        loader = DataLoader(
-            TensorDataset(Xt, mt, yt), batch_size=batch_size, shuffle=True
-        )
+    St = (
+        torch.tensor(S_tr, dtype=torch.float32).to(device)
+        if S_tr is not None
+        else None
+    )
+    n_tr = len(Xt)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.L1Loss()
@@ -267,12 +263,11 @@ def train_model(
     for ep in epoch_bar:
         model.train()
         ep_loss = 0.0
-        for batch in loader:
-            if use_scalars:
-                xb, mb, yb, sb = [t.to(device) for t in batch]
-            else:
-                xb, mb, yb = [t.to(device) for t in batch]
-                sb = None
+        perm = torch.randperm(n_tr, device=device)
+        for i in range(0, n_tr, batch_size):
+            idx = perm[i : i + batch_size]
+            xb, mb, yb = Xt[idx], mt[idx], yt[idx]
+            sb = St[idx] if St is not None else None
             if augment_fn is not None:
                 xb = augment_fn(xb)
             opt.zero_grad()
@@ -281,7 +276,7 @@ def train_model(
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             ep_loss += loss.item() * len(yb)
-        train_curve.append(ep_loss / len(yt))
+        train_curve.append(ep_loss / n_tr)
 
         model.eval()
         with torch.no_grad():

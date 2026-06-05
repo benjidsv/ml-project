@@ -405,6 +405,7 @@ def run_grouped_cv(
     patience: int = 50,
     scheduler: str | None = "cosine",
     progress: bool = True,
+    compile_model: bool = False,
 ) -> list[dict]:
     """Grouped cross-validation for the extended multi-dataset pipeline.
 
@@ -426,6 +427,10 @@ def run_grouped_cv(
         For LODO:       pass ds_groups (dataset-level labels from attach_targets_extended).
     epochs, batch_size, lr, weight_decay, patience, scheduler, progress
         Forwarded to sequence.train_model — same defaults as run_lobo.
+    compile_model : bool
+        If True, wraps each freshly created model with torch.compile() before
+        training.  Can speed up MPS/CPU depending on model size; first fold pays
+        the compilation cost (~10–60 s) — subsequent folds reuse the compiled graph.
 
     Returns
     -------
@@ -487,6 +492,8 @@ def run_grouped_cv(
 
         torch.manual_seed(fold_idx * 31 + 42)
         model = model_factory().to(device)
+        if compile_model:
+            model = torch.compile(model)
 
         model, train_curve, val_curve, best_ep = train_model(
             model,

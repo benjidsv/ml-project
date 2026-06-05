@@ -191,7 +191,7 @@ class VGCNNLSTM(nn.Module):
         # Without it, 8 filters × random seed = bimodal results (sometimes great, sometimes catastrophic).
         # num_groups=4 → 2 channels per group, works for any cnn_ch divisible by 4.
         self.cnn = nn.Sequential(
-            nn.Conv1d(n_features, cnn_ch, kernel_size=5, padding=2),
+            nn.Conv1d(n_features, cnn_ch, kernel_size=5, padding=2, bias=False),
             nn.GroupNorm(num_groups=4, num_channels=cnn_ch),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -222,6 +222,10 @@ class VGCNNLSTM(nn.Module):
 
         # CNN front-end: (B, L, C) → (B, C, L) → conv blocks → (B, L, cnn_ch)
         x = self.cnn(x.transpose(1, 2)).transpose(1, 2)  # (B, L, cnn_ch)
+
+        # Re-zero the padded timesteps before the LSTM ---
+        # mask is (B, L) bool. We unsqueeze to (B, L, 1) and multiply.
+        x = x * mask.unsqueeze(-1).to(x.dtype)
 
         # Optional LSTM initial state
         h0, c0 = None, None
