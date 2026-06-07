@@ -6,7 +6,9 @@
     - Main inspiration for baseline
 - [Domain-Adversarial Training of Neural Networks](https://arxiv.org/abs/1505.07818)
 - [CORAL: Correlation Alignment for Deep Domain Adaptation](https://arxiv.org/abs/1607.01719)
-    - Tested in notebook 4 to compensate for domain shift between CALCE and NASA datasets
+    - Tested in notebook 4 to compensate for domain shift between CALCE and NASA datasets - bad results
+- [Distributionally Robust Neural Networks for Group Shifts: On the Importance of Regularization for Worst-Case Generalization](https://arxiv.org/abs/1911.08731)
+    - Tested in nb05 to replace CORAL/DANN since GroupDRO doesn't need target data in batches (which is absent in LODO)
 
 ### Phase 1
 The initial phase used only the NASA controlled and randomized datasets. We tested a random forest baseline built using hand crafted scalars against a CNN, LSTM, and a CNN-LSTM hybrid. However, it was impossible to beat RF at this stage. However, we discovered that to match RF, we had to use voltage indexed curves (and time as a feature). Performance on RW was acceptable.

@@ -198,6 +198,7 @@ def train_model(
     S_val: np.ndarray | None = None,
     progress: bool = True,
     es_window: int = 5,
+    use_amp: bool = False,
 ) -> tuple:
     """Train with early stopping on val MSE loss.
 
@@ -255,6 +256,9 @@ def train_model(
             opt, mode="min", patience=10, factor=0.5, min_lr=lr * 0.01
         )
 
+    _amp_enabled = use_amp and device.type == "cuda"
+    _scaler = torch.amp.GradScaler("cuda", enabled=_amp_enabled)
+
     best_val, best_state, best_ep = float("inf"), None, 0
     best_smooth = float("inf")
     train_curve, val_curve = [], []
@@ -278,15 +282,18 @@ def train_model(
             if augment_fn is not None:
                 xb = augment_fn(xb)
             opt.zero_grad()
-            loss = loss_fn(model(xb, mb, sb), yb)
-            loss.backward()
+            with torch.autocast(device_type=device.type, enabled=_amp_enabled):
+                loss = loss_fn(model(xb, mb, sb), yb)
+            _scaler.scale(loss).backward()
+            _scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            _scaler.step(opt)
+            _scaler.update()
             ep_loss += loss.item() * len(yb)
         train_curve.append(ep_loss / n_tr)
 
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=_amp_enabled):
             vl = loss_fn(model(Xv, mv, Sv), yv).item()
         val_curve.append(vl)
 

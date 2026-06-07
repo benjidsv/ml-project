@@ -312,7 +312,7 @@ def train_model_da(
 
     # AMP: only meaningful on CUDA; silently disabled on CPU/MPS
     _amp_enabled = use_amp and device.type == "cuda"
-    _scaler = torch.cuda.amp.GradScaler(enabled=_amp_enabled)
+    _scaler = torch.amp.GradScaler("cuda", enabled=_amp_enabled)
 
     best_val, best_state, best_ep = float("inf"), None, 0
     best_smooth = float("inf")
@@ -433,5 +433,197 @@ def train_model_da(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+
+    return model, train_curve, val_curve, best_ep
+
+
+# ---------------------------------------------------------------------------
+# GroupDRO training loop
+# ---------------------------------------------------------------------------
+
+
+def train_model_dro(
+    model: nn.Module,
+    X_tr: np.ndarray,
+    mask_tr: np.ndarray,
+    y_tr: np.ndarray,
+    X_val: np.ndarray,
+    mask_val: np.ndarray,
+    y_val: np.ndarray,
+    device: torch.device,
+    domains_tr: np.ndarray,             # (n_tr,) int — study-group ids
+    group_lr: float = 0.01,             # exponential reweighting step size η
+    epochs: int = 300,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    patience: int = 50,
+    scheduler: str | None = "cosine",
+    augment_fn: Callable | None = None,
+    window_dropout: float = 0.0,
+    mixup_alpha: float = 0.0,
+    progress: bool = True,
+    es_window: int = 5,
+    use_amp: bool = False,
+) -> tuple:
+    """GroupDRO (Sagawa et al. 2020): minimize worst-group risk.
+
+    Unlike CORAL/DANN which require target-domain samples in-batch,
+    GroupDRO needs no target data.  It minimises a reweighted objective
+    that concentrates training on the hardest protocol — directly aligned
+    with LODO, where the objective is cross-dataset transfer.
+
+    Algorithm per batch
+    -------------------
+    ℓ_g ← mean L1(pred, y) for samples in group g   (present groups only)
+    q_g ← q_g · exp(η · ℓ_g)                        (exponential upweight)
+    q   ← q / sum(q)                                  (renormalise)
+    loss ← Σ_g q_g · ℓ_g                             (weighted objective)
+
+    q is maintained globally across the full training run (not reset per batch).
+    Gradient flows through ℓ_g; q is treated as a constant (detached).
+
+    Returns (model_at_best_val, train_curve, val_curve, best_epoch).
+    """
+    Xt = torch.tensor(X_tr,    dtype=torch.float32).to(device)
+    mt = torch.tensor(mask_tr, dtype=torch.bool   ).to(device)
+    yt = torch.tensor(y_tr,    dtype=torch.float32).to(device)
+    Xv = torch.tensor(X_val,   dtype=torch.float32).to(device)
+    mv = torch.tensor(mask_val, dtype=torch.bool  ).to(device)
+    yv = torch.tensor(y_val,   dtype=torch.float32).to(device)
+    dt = torch.tensor(domains_tr, dtype=torch.int64).to(device)
+
+    unique_d, dt = torch.unique(dt, return_inverse=True)
+    n_domains = int(len(unique_d))
+
+    n_tr = len(Xt)
+
+    # Group weights: uniform init, updated across the full training run
+    q = torch.ones(n_domains, device=device) / n_domains
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    l1_fn = nn.L1Loss(reduction="none")  # per-sample losses needed for group weighting
+
+    sched = None
+    if scheduler == "cosine":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=epochs, eta_min=lr * 0.01
+        )
+    elif scheduler == "plateau":
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", patience=10, factor=0.5, min_lr=lr * 0.01
+        )
+
+    _amp_enabled = use_amp and device.type == "cuda"
+    _scaler = torch.amp.GradScaler("cuda", enabled=_amp_enabled)
+
+    best_val, best_state, best_ep = float("inf"), None, 0
+    best_smooth = float("inf")
+    train_curve, val_curve = [], []
+    no_improve = 0
+
+    domain_sampler = _DomainBatchSampler(dt, batch_size, device)
+
+    epoch_bar = tqdm(
+        range(1, epochs + 1),
+        leave=False,
+        unit="ep",
+        bar_format="{l_bar}{bar:20}{r_bar}",
+        disable=not progress,
+    )
+
+    for ep in epoch_bar:
+        model.train()
+        ep_loss = 0.0
+        batches = domain_sampler()
+
+        for idx in batches:
+            xb = Xt[idx]
+            mb = mt[idx]
+            yb = yt[idx]
+            db = dt[idx]
+
+            if window_dropout > 0.0:
+                xb, mb = _window_dropout(xb, mb, window_dropout)
+
+            if augment_fn is not None:
+                xb = augment_fn(xb)
+
+            if mixup_alpha > 0.0:
+                lam_mix = float(torch.distributions.Beta(mixup_alpha, mixup_alpha).sample())
+                perm_mix = torch.randperm(len(xb), device=device)
+                xb = lam_mix * xb + (1 - lam_mix) * xb[perm_mix]
+                yb = lam_mix * yb + (1 - lam_mix) * yb[perm_mix]
+                mb = mb & mb[perm_mix]
+
+            opt.zero_grad()
+
+            with torch.autocast(device_type=device.type, enabled=_amp_enabled):
+                pred = model(xb, mb)
+                per_sample = l1_fn(pred, yb)  # (B,) — gradients flow through this
+
+                # Per-group mean losses (gradient-tracked)
+                present, g_losses = [], []
+                for g in range(n_domains):
+                    mask_g = db == g
+                    if mask_g.any():
+                        present.append(g)
+                        g_losses.append(per_sample[mask_g].mean())
+
+                # Exponential reweight (no gradient through q)
+                with torch.no_grad():
+                    for i, g in enumerate(present):
+                        q[g] = q[g] * math.exp(group_lr * g_losses[i].item())
+                    q.clamp_(min=1e-8)  # floor: prevent float-underflow zeroing easy groups
+                    q.div_(q.sum())
+
+                loss = sum(q[g].detach() * g_losses[i] for i, g in enumerate(present))
+
+            _scaler.scale(loss).backward()
+            _scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            _scaler.step(opt)
+            _scaler.update()
+
+            ep_loss += per_sample.detach().mean().item() * len(yb)
+
+        train_curve.append(ep_loss / n_tr)
+
+        model.eval()
+        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=_amp_enabled):
+            pred_val = model(Xv, mv)
+            vl = nn.L1Loss()(pred_val, yv).item()
+        val_curve.append(vl)
+
+        if sched is not None:
+            sched.step(vl) if scheduler == "plateau" else sched.step()
+
+        epoch_bar.set_postfix(val=f"{vl:.4f}", best=f"{best_val:.4f}", ep=ep)
+
+        if vl < best_val - 1e-6:
+            best_val = vl
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_ep = ep
+
+        smooth_val = (
+            float(np.mean(val_curve[-es_window:]))
+            if len(val_curve) >= es_window
+            else vl
+        )
+        if smooth_val < best_smooth - 1e-6:
+            best_smooth = smooth_val
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Stash final group weights for observability (sum to 1; should concentrate on hardest group)
+    model._dro_q = q.detach().cpu().numpy()
+    _q_str = "  ".join(f"{qi:.3f}" for qi in model._dro_q)
+    print(f"  DRO q: [{_q_str}]  sum={model._dro_q.sum():.4f}")
 
     return model, train_curve, val_curve, best_ep

@@ -98,10 +98,34 @@ def channel_jitter(
 # ---------------------------------------------------------------------------
 
 
+def time_warp(
+    xb: torch.Tensor,
+    lo: float = 0.8,
+    hi: float = 1.25,
+) -> torch.Tensor:
+    """Scale the t_elapsed channel by a per-sample random factor.
+
+    Unlike ``rate_warp`` (which jointly scales C-rate and t_elapsed to simulate
+    a different charge rate), ``time_warp`` perturbs only t_elapsed.  This
+    simulates SOC-window or measurement-timing variation independently of the
+    charge rate — a complementary perturbation axis for the aug sweep.
+
+    s ~ U(lo, hi):
+        t_elapsed ← t_elapsed × s
+    """
+    B = xb.shape[0]
+    s = torch.empty(B, device=xb.device, dtype=xb.dtype).uniform_(lo, hi)
+    xb_aug = xb.clone()
+    xb_aug[:, :, CH_TELAPSED] = xb[:, :, CH_TELAPSED] * s.view(B, 1)
+    return xb_aug
+
+
 def make_augment(
     rate_warp_lo: float = 0.8,
     rate_warp_hi: float = 1.25,
     jitter_sigma: float = 0.01,
+    time_warp_lo: float = 1.0,
+    time_warp_hi: float = 1.0,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return a composed augmentation function compatible with train_model's
     ``augment_fn`` hook (signature: ``(xb: Tensor) -> Tensor``).
@@ -111,6 +135,8 @@ def make_augment(
     rate_warp_lo / hi : bounds of the rate-warp U distribution.
         Set both to 1.0 to disable rate warping.
     jitter_sigma : noise std for channel_jitter.  0.0 disables jitter.
+    time_warp_lo / hi : bounds for time_warp (t_elapsed-only scale).
+        Set both to 1.0 to disable (default).
 
     Example
     -------
@@ -118,12 +144,15 @@ def make_augment(
         results = run_grouped_cv(lambda: VGGRUReg(n_features=4), ...,
                                   train_kwargs={"augment_fn": aug})
     """
-    do_warp   = not (rate_warp_lo == 1.0 and rate_warp_hi == 1.0)
-    do_jitter = jitter_sigma > 0.0
+    do_warp      = not (rate_warp_lo == 1.0 and rate_warp_hi == 1.0)
+    do_jitter    = jitter_sigma > 0.0
+    do_time_warp = not (time_warp_lo == 1.0 and time_warp_hi == 1.0)
 
     def _augment(xb: torch.Tensor) -> torch.Tensor:
         if do_warp:
             xb = rate_warp(xb, lo=rate_warp_lo, hi=rate_warp_hi)
+        if do_time_warp:
+            xb = time_warp(xb, lo=time_warp_lo, hi=time_warp_hi)
         if do_jitter:
             xb = channel_jitter(xb, sigma=jitter_sigma)
         return xb

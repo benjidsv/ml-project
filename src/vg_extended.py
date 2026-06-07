@@ -409,7 +409,8 @@ def run_grouped_cv(
     patience: int = 50,
     scheduler: str | None = "cosine",
     progress: bool = True,
-    compile_model: bool = False,
+    verbose: bool = True,
+    seed: int = 42,
     train_fn: Callable | None = None,
     domains: np.ndarray | None = None,
     train_kwargs: dict | None = None,
@@ -434,10 +435,10 @@ def run_grouped_cv(
         For LODO:       pass ds_groups (dataset-level labels from attach_targets_extended).
     epochs, batch_size, lr, weight_decay, patience, scheduler, progress
         Forwarded to the train function — same defaults as run_lobo.
-    compile_model : bool
-        If True, wraps each freshly created model with torch.compile() before
-        training.  Can speed up MPS/CPU depending on model size; first fold pays
-        the compilation cost (~10–60 s) — subsequent folds reuse the compiled graph.
+    seed : int
+        Base random seed. Each fold uses ``fold_idx * 31 + seed`` so folds are
+        independently seeded while different ``seed`` values produce different
+        weight initialisations for multi-seed experiments.
     train_fn : callable | None
         Training function to use instead of ``sequence.train_model``.  Must
         accept the same positional arguments (model, X_tr, mask_tr, y_tr,
@@ -529,10 +530,8 @@ def run_grouped_cv(
         X_val_s = _reapply_fill(X_val_s, mask_val)
         X_te_s = _reapply_fill(X_te_s, mask_te)
 
-        torch.manual_seed(fold_idx * 31 + 42)
+        torch.manual_seed(fold_idx * 31 + seed)
         model = model_factory().to(device)
-        if compile_model:
-            model = torch.compile(model)
 
         # Merge fold-specific domain slice if provided
         fold_kw = dict(_extra_kw)
@@ -571,12 +570,13 @@ def run_grouped_cv(
         held_group = sorted(set(split_groups[is_test]))
         held_str = ",".join(held_group[:3]) + ("…" if len(held_group) > 3 else "")
 
-        print(
-            f"  [{fold_idx + 1:2d}/{n_folds}] held={held_str:20s}  "
-            f"val={val_bid}  "
-            f"MAE={metrics['mae']:.4f}  R²={metrics['r2']:.3f}  "
-            f"best_ep={best_ep}"
-        )
+        if verbose:
+            print(
+                f"  [{fold_idx + 1:2d}/{n_folds}] held={held_str:20s}  "
+                f"val={val_bid}  "
+                f"MAE={metrics['mae']:.4f}  R²={metrics['r2']:.3f}  "
+                f"best_ep={best_ep}"
+            )
 
         folds.append({
             "held_bids": held_bids,
