@@ -30,6 +30,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from scipy.integrate import cumulative_trapezoid
 from scipy.stats import spearmanr
 
 # ---------------------------------------------------------------------------
@@ -106,9 +107,17 @@ def resample_voltage_grid(
 
     Returns
     -------
-    tensor : (n_grid, 3) float32 or None
-        Channels: [|I|, T, t_elapsed_s].  Uncovered grid positions filled
-        with 0.0 (matches the scaled channel mean, the least-informative fill).
+    tensor : (n_grid, 5) float32 or None
+        Channels: [|I|, ΔT, t_elapsed_s, Q_Ah, dQ/dV].
+          |I|       — absolute current in amps (C-rate normalisation done downstream).
+          ΔT        — temperature rise relative to the CC-segment start (°C); removes
+                      protocol/ambient offset that fingerprints cell pools with
+                      constant-temperature imputation (e.g. CALCE ΔT ≡ 0).
+          t_elapsed — seconds from CC-segment start.
+          Q_Ah      — cumulative charge delivered (Ah); C-nom normalisation downstream.
+          dQ/dV     — incremental capacity (Ah/V); computed over the descending grid.
+        Uncovered grid positions filled with 0.0 (matches the scaled channel mean,
+        the least-informative fill; re-zeroed by _reapply_fill after global_scale).
     mask : (n_grid,) bool or None
         True = valid grid position (voltage covered by this cycle).
         The valid region is a LEADING block (high-V end) because the grid
@@ -195,26 +204,51 @@ def resample_voltage_grid(
     if covered < min_pts:
         return None, None, {**_empty, "coverage": covered / n_grid}
 
-    # --- Interpolate |I|, T, t_elapsed at covered grid voltages ---
+    # --- Cumulative charge Q(t) integrated over the CC segment (Ah) ---
+    # cumulative_trapezoid returns n-1 values; prepend 0 for the segment start.
+    Q_t = np.zeros(len(seg_I), dtype=np.float64)
+    if len(seg_I) >= 2:
+        Q_t[1:] = cumulative_trapezoid(seg_I, seg_time) / 3600.0
+
+    # Temperature relative to segment start — removes protocol/ambient-offset bias.
+    # For cells with imputed constant temperature (CALCE), ΔT ≡ 0 everywhere,
+    # so it carries no dataset-identity information after global_scale.
+    T_start = float(seg_T[0])
+
+    # --- Interpolate all channels at covered grid voltages ---
     # seg_V_mono is non-decreasing; vg[mask] is the query in the same direction
     # (descending, but interp accepts out-of-order query). We query against the
     # ascending axis using vg_covered directly.
     vg_covered = vg[mask]  # still descending subset; np.interp requires xp ascending
     # Flip so xp is ascending for np.interp
     xp = seg_V_mono
-    r_I_c = np.interp(vg_covered, xp, seg_I)
-    r_T_c = np.interp(vg_covered, xp, seg_T)
-    r_te_c = np.interp(vg_covered, xp, t_elapsed)
+    r_I_c   = np.interp(vg_covered, xp, seg_I)
+    r_dT_c  = np.interp(vg_covered, xp, seg_T) - T_start  # ΔT from segment start
+    r_te_c  = np.interp(vg_covered, xp, t_elapsed)
+    Q_grd_c = np.interp(vg_covered, xp, Q_t)
 
-    # Build full tensor, fill uncovered (tail) with 0.0
-    r_I = np.zeros(n_grid, dtype=np.float32)
-    r_T = np.zeros(n_grid, dtype=np.float32)
-    r_te = np.zeros(n_grid, dtype=np.float32)
-    r_I[mask] = r_I_c.astype(np.float32)
-    r_T[mask] = r_T_c.astype(np.float32)
-    r_te[mask] = r_te_c.astype(np.float32)
+    # dQ/dV: both Q and V decrease together on the descending grid, so the ratio
+    # is positive.  np.gradient handles non-uniform and negative spacing correctly.
+    if len(vg_covered) > 1:
+        dQdV_c = np.gradient(Q_grd_c, vg_covered)
+    else:
+        dQdV_c = np.zeros_like(Q_grd_c)
 
-    tensor = np.stack([r_I, r_T, r_te], axis=-1)  # (n_grid, 3) float32
+    # Build full tensor, fill uncovered (tail) with 0.0.
+    # _reapply_fill (called after global_scale) re-zeros these positions in the
+    # scaled domain, so the exact raw fill value does not matter.
+    r_I    = np.zeros(n_grid, dtype=np.float32)
+    r_dT   = np.zeros(n_grid, dtype=np.float32)
+    r_te   = np.zeros(n_grid, dtype=np.float32)
+    r_Q    = np.zeros(n_grid, dtype=np.float32)
+    r_dQdV = np.zeros(n_grid, dtype=np.float32)
+    r_I[mask]    = r_I_c.astype(np.float32)
+    r_dT[mask]   = r_dT_c.astype(np.float32)
+    r_te[mask]   = r_te_c.astype(np.float32)
+    r_Q[mask]    = Q_grd_c.astype(np.float32)
+    r_dQdV[mask] = dQdV_c.astype(np.float32)
+
+    tensor = np.stack([r_I, r_dT, r_te, r_Q, r_dQdV], axis=-1)  # (n_grid, 5) float32
     coverage = float(covered / n_grid)
 
     return tensor, mask, {"cc_dt": cc_dt, "cc_slope": cc_slope, "coverage": coverage}

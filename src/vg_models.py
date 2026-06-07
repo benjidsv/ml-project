@@ -213,10 +213,21 @@ class VGGRUReg(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,  # (B, L, C)
-        mask: torch.Tensor,  # (B, L) bool
-        s: torch.Tensor | None = None,  # (B, n_scalars) optional
+        x: torch.Tensor,           # (B, L, C)
+        mask: torch.Tensor,        # (B, L) bool
+        s: torch.Tensor | None = None,          # (B, n_scalars) optional
+        return_features: bool = False,
     ) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        return_features : bool
+            When True, return ``(pred, feats)`` where ``feats`` is the
+            post-dropout pooled representation (B, 4H) used as input to the
+            regression head.  Used by domain-adaptation training (vg_da.py)
+            to apply CORAL / DANN auxiliary losses on the feature space.
+        """
         B, L, _ = x.shape
 
         h0 = None
@@ -227,12 +238,17 @@ class VGGRUReg(nn.Module):
         # out: (B, L, 2H)
 
         pooled = masked_pool(out, mask)  # (B, 4H)
-        pooled = self.drop(pooled)
+        feats  = self.drop(pooled)       # post-dropout features (for DA alignment)
 
+        feats_head = feats
         if self.scalar_mode == "head" and s is not None:
-            pooled = torch.cat([pooled, s], dim=-1)
+            feats_head = torch.cat([feats, s], dim=-1)
 
-        return self.fc(pooled).squeeze(-1)  # (B,)
+        pred = self.fc(feats_head).squeeze(-1)  # (B,)
+
+        if return_features:
+            return pred, feats
+        return pred
 
 # ---------------------------------------------------------------------------
 # CNN Feature Extractor (to pair with LSTM or GRU)

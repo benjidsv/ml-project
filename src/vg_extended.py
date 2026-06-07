@@ -79,15 +79,19 @@ def _load_nasa_labels(project_root: Path) -> pd.DataFrame:
 
 
 def _normalize_crate(records: list[dict], c_nominal: float) -> list[dict]:
-    """Divide the |I| channel (index 0) of each tensor by c_nominal in-place copy.
+    """Divide |I| (ch 0) and Q_Ah (ch 3) by c_nominal to get C-rate and Q_frac.
 
     NASA extractors return raw Amps; this converts to C-rate to match the
     CALCE/BatteryArchive tensors produced by extract_timeseries_vg.
+    Channel 3 (Q_Ah, cumulative charge) is divided by c_nominal to yield a
+    fractional charge [0, ~1] that is protocol-invariant across cell pools.
     """
     for r in records:
         if r["tensor"] is not None:
             t = r["tensor"].copy()
-            t[:, 0] /= c_nominal
+            t[:, 0] /= c_nominal                    # |I| [A] → C-rate [1/h]
+            if t.shape[1] > 3:                       # Q channel present (5-ch tensor)
+                t[:, 3] /= c_nominal                 # Q [Ah] → Q_frac [per C_nom]
             r["tensor"] = t
     return records
 
@@ -334,7 +338,7 @@ def attach_targets_extended(
 
     print(
         f"  Dataset: {len(df)} samples, {n_grid} grid pts, "
-        f"y ∈ [{y.min():.3f}, {y.max():.3f}], "
+        f"y in [{y.min():.3f}, {y.max():.3f}], "
         f"{len(set(groups))} cells, {len(set(ds_groups))} dataset groups"
     )
     return X, mask_arr, y, groups, cidx, ds_groups
@@ -406,6 +410,9 @@ def run_grouped_cv(
     scheduler: str | None = "cosine",
     progress: bool = True,
     compile_model: bool = False,
+    train_fn: Callable | None = None,
+    domains: np.ndarray | None = None,
+    train_kwargs: dict | None = None,
 ) -> list[dict]:
     """Grouped cross-validation for the extended multi-dataset pipeline.
 
@@ -426,11 +433,29 @@ def run_grouped_cv(
         For GroupKFold: omit (defaults to battery groups — whole-cell folds).
         For LODO:       pass ds_groups (dataset-level labels from attach_targets_extended).
     epochs, batch_size, lr, weight_decay, patience, scheduler, progress
-        Forwarded to sequence.train_model — same defaults as run_lobo.
+        Forwarded to the train function — same defaults as run_lobo.
     compile_model : bool
         If True, wraps each freshly created model with torch.compile() before
         training.  Can speed up MPS/CPU depending on model size; first fold pays
         the compilation cost (~10–60 s) — subsequent folds reuse the compiled graph.
+    train_fn : callable | None
+        Training function to use instead of ``sequence.train_model``.  Must
+        accept the same positional arguments (model, X_tr, mask_tr, y_tr,
+        X_val, mask_val, y_val, device) and the same keyword arguments
+        (epochs, batch_size, lr, weight_decay, patience, scheduler, progress).
+        Extra keyword arguments are passed via ``train_kwargs``.
+        Default (None) uses ``sequence.train_model``.
+    domains : (n,) int or str array | None
+        Per-sample domain labels aligned with X/y/groups.  When provided and
+        ``train_fn`` is set (e.g. ``vg_da.train_model_da``), the fold slice
+        ``domains[is_train]`` is passed as ``domains_tr`` in ``train_kwargs``.
+        Typically these are integer-encoded study-group labels (NASA_CTRL,
+        NASA_RW, CALCE_CS2_T1, …) rather than dataset-level labels, so that
+        domain alignment remains meaningful even under LODO.
+    train_kwargs : dict | None
+        Additional keyword arguments forwarded to ``train_fn`` on every fold
+        *before* any fold-specific arguments (``domains_tr`` etc.) are merged.
+        For example: ``{"da_mode": "coral", "da_weight": 0.1, "augment_fn": aug}``.
 
     Returns
     -------
@@ -440,29 +465,34 @@ def run_grouped_cv(
         train_curve, val_curve, best_epoch,
         metrics  (keys: mae, rmse, r2, skill, spearman, naive_mae, n)
 
-    Example
-    -------
+    Example — domain-adaptation (CORAL)
+    ------------------------------------
         from sklearn.model_selection import GroupKFold, LeaveOneGroupOut
         from vg_extended import run_grouped_cv, load_npz_ext
-        from vg_models import VGCNNLSTM
+        from vg_models import VGGRUReg
+        from vg_da import train_model_da
+        from vg_augment import make_augment
 
         X, mask, y, groups, cidx, ds_groups = load_npz_ext(path)
+        # study_groups: per-sample protocol labels (defined in notebook)
+        domain_ids = np.array([study_group_to_int[g] for g in study_groups])
 
-        # Headline: 8-fold whole-cell CV
-        folds_gkf = run_grouped_cv(
-            lambda: VGCNNLSTM(), X, mask, y, groups, cidx, device,
-            GroupKFold(n_splits=8),
-        )
-
-        # Transfer: Leave-One-Dataset-Out
-        folds_lodo = run_grouped_cv(
-            lambda: VGCNNLSTM(), X, mask, y, groups, cidx, device,
-            LeaveOneGroupOut(), cv_groups=ds_groups,
+        aug = make_augment(rate_warp_lo=0.8, rate_warp_hi=1.25, jitter_sigma=0.01)
+        folds = run_grouped_cv(
+            lambda: VGGRUReg(n_features=4, hidden=47),
+            X[..., [0, 1, 3, 4]], mask, y, groups, cidx, device,
+            GroupKFold(n_splits=6), cv_groups=study_groups,
+            train_fn=train_model_da,
+            domains=domain_ids,
+            train_kwargs={"da_mode": "coral", "da_weight": 0.1, "augment_fn": aug},
         )
     """
     import torch
-    from src.sequence import train_model
+    from src.sequence import train_model as _default_train
     from src.vg_models import predict_vg
+
+    _train_fn = train_fn if train_fn is not None else _default_train
+    _extra_kw = dict(train_kwargs) if train_kwargs else {}
 
     split_groups = cv_groups if cv_groups is not None else groups
     n_folds = splitter.get_n_splits(X, groups=split_groups)
@@ -473,13 +503,22 @@ def run_grouped_cv(
         is_test[test_idx] = True
         is_avail = ~is_test
 
-        # Inner-val: last-alphabetical battery from the HELD group.
-        # Keeps all training batteries in training and uses a same-domain val signal.
-        # Test is the full held group — early-stopping leakage on val_bid is accepted.
-        held_bids_sorted = sorted(set(groups[is_test]))
-        val_bid = held_bids_sorted[-1]
-        is_val = is_test & (groups == val_bid)
-        is_train = is_avail  # full training pool — no battery stolen for val
+        # Inner-val: last-alphabetical battery from the *largest study group in the
+        # training pool*.  The val cell is source-domain only — early stopping can
+        # never see the held (test) dataset's distribution.  The val cell is
+        # withheld from training so it provides an uncontaminated stopping signal.
+        avail_bids = sorted(set(groups[is_avail]))
+        bid_sg = {b: split_groups[is_avail & (groups == b)][0] for b in avail_bids}
+        sg_sample_counts: dict = {}
+        for b in avail_bids:
+            sg = bid_sg[b]
+            sg_sample_counts[sg] = sg_sample_counts.get(sg, 0) + int(
+                (is_avail & (groups == b)).sum()
+            )
+        largest_sg = max(sg_sample_counts, key=lambda k: sg_sample_counts[k])
+        val_bid    = sorted(b for b, sg in bid_sg.items() if sg == largest_sg)[-1]
+        is_val   = is_avail & (groups == val_bid)
+        is_train = is_avail & (groups != val_bid)
 
         X_tr, mask_tr, y_tr = X[is_train], mask[is_train], y[is_train]
         X_val, mask_val, y_val = X[is_val], mask[is_val], y[is_val]
@@ -495,7 +534,18 @@ def run_grouped_cv(
         if compile_model:
             model = torch.compile(model)
 
-        model, train_curve, val_curve, best_ep = train_model(
+        # Merge fold-specific domain slice if provided
+        fold_kw = dict(_extra_kw)
+        if domains is not None:
+            # Encode study-group strings to integers if needed
+            d = domains[is_train]
+            if d.dtype.kind not in ("i", "u"):
+                uniq = sorted(set(d.tolist()))
+                d_map = {v: i for i, v in enumerate(uniq)}
+                d = np.array([d_map[v] for v in d], dtype=np.int64)
+            fold_kw["domains_tr"] = d
+
+        model, train_curve, val_curve, best_ep = _train_fn(
             model,
             X_tr_s,
             mask_tr,
@@ -511,6 +561,7 @@ def run_grouped_cv(
             patience=patience,
             scheduler=scheduler,
             progress=progress,
+            **fold_kw,
         )
 
         y_pred = predict_vg(model, X_te_s, mask_te, device)

@@ -359,7 +359,9 @@ def extract_timeseries_vg(
 
             if tensor is not None:
                 tensor = tensor.copy()
-                tensor[:, 0] /= c_nominal  # |I| → C-rate
+                tensor[:, 0] /= c_nominal          # |I| [A] → C-rate [1/h]
+                if tensor.shape[1] > 3:             # Q channel present (5-ch tensor)
+                    tensor[:, 3] /= c_nominal       # Q [Ah] → Q_frac [per C_nom]
 
         records.append({
             "battery_id": bid,
