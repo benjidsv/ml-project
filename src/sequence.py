@@ -6,6 +6,8 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence
 from tqdm.auto import tqdm
 
+from src.vg_augment import end_cutout, grid_shift
+
 
 # ---------------------------------------------------------------------------
 # Windowing
@@ -199,6 +201,9 @@ def train_model(
     progress: bool = True,
     es_window: int = 5,
     use_amp: bool = False,
+    cutout_frac: float = 0.0,
+    gridshift_max: int = 0,
+    mixup_alpha: float = 0.0,
 ) -> tuple:
     """Train with early stopping on val MSE loss.
 
@@ -281,6 +286,16 @@ def train_model(
             sb = St[idx] if St is not None else None
             if augment_fn is not None:
                 xb = augment_fn(xb)
+            if cutout_frac > 0.0:
+                xb, mb = end_cutout(xb, mb, cutout_frac)
+            if gridshift_max > 0:
+                xb, mb = grid_shift(xb, mb, gridshift_max)
+            if mixup_alpha > 0.0:
+                lam = float(torch.distributions.Beta(mixup_alpha, mixup_alpha).sample())
+                perm = torch.randperm(len(xb), device=device)
+                xb = lam * xb + (1.0 - lam) * xb[perm]
+                yb = lam * yb + (1.0 - lam) * yb[perm]
+                mb = mb & mb[perm]
             opt.zero_grad()
             with torch.autocast(device_type=device.type, enabled=_amp_enabled):
                 loss = loss_fn(model(xb, mb, sb), yb)
