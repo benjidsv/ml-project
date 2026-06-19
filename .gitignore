@@ -1,3 +1,7 @@
 /data/
-/results/
+.claude
+.venv
+/models/
 *.pyc
+/scripts
+.DS_Store

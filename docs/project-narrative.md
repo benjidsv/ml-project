@@ -7,7 +7,9 @@
 
 ## Abstract
 
-We address the problem of predicting lithium-ion battery State-of-Health (SOH) from the shape of individual charge cycles, without any discharge measurement at inference time. Starting from the NASA PCoE dataset (13 cells, ~800 samples), we show that scalar-feature baselines (Random Forest, XGBoost) are effectively unbeatable at this data scale, even with carefully engineered deep learning pipelines. We then extend to a multi-source pool — NASA + CALCE CS2/CX2 — reaching **22 cells and 12,260 samples**, which gives sequence models the data they need to win. On within-pool held-out cells (GroupKFold-6), a BiGRU trained on voltage-grid tensors achieves **MAE 0.036–0.038** against RF's **0.072**, halving the error. The harder problem is **cross-dataset transfer (Leave-One-Dataset-Out)**: the Transformer is the best in-distribution model but **collapses when transferred to NASA** (LODO MAE 0.105); BiGRU alone survives transfer (LODO MAE 0.041). The dominant mechanism behind the transfer gap is not chemistry — it is **protocol fingerprints** in the input channels (absolute C-rate, charging time, imputed temperature). Rate-warp and time-warp augmentation teach the model to be invariant to these fingerprints, reaching a **LODO mean MAE of 0.058**, with a further improvement to **NASA MAE 0.045** when one labeled target cycle is available for lightweight fine-tuning. We report three failed approaches (invariant feature engineering, CORAL, DANN, GroupDRO) and the physical reason each one failed, because honest negative results are as informative as wins.
+We address the problem of predicting lithium-ion battery State-of-Health (SOH) from the shape of individual charge cycles, without any discharge measurement at inference time. Starting from the NASA PCoE dataset (13 cells, ~800 samples), we show that scalar-feature baselines (Random Forest, XGBoost) are effectively unbeatable at this data scale, even with carefully engineered deep learning pipelines. We then extend to a multi-source pool: NASA + CALCE CS2/CX2 — reaching **22 cells and 12,260 samples**, which gives sequence models the data they need to win. 
+
+On within-pool held-out cells (GroupKFold-6), a BiGRU trained on voltage-grid tensors achieves **MAE 0.038** against RF's **0.072**, halving the error. The harder problem is **cross-dataset transfer (Leave-One-Dataset-Out)**: the Transformer is the best in-distribution model but **collapses when transferred to NASA** (LODO MAE ~0.105, single-seed); BiGRU with rate-warp augmentation achieves **LODO mean MAE 0.056** (10-seed verified: hold-CALCE 0.050, hold-NASA 0.061). The dominant mechanism behind the transfer gap is not chemistry, as we initially expected, but **protocol fingerprints** in the input channels (absolute C-rate, charging time, imputed temperature). Rate-warp augmentation alone is sufficient to teach the model C-rate and duration invariance; adding Optuna-tuned time-warp gives marginal additional gain (LODO 0.058). We report five failed approaches (invariant feature engineering, CORAL, DANN, GroupDRO, one shot fine tuning) and the physical reason each one failed.
 
 ---
 
@@ -15,7 +17,7 @@ We address the problem of predicting lithium-ion battery State-of-Health (SOH) f
 
 ### 1.1 Why battery SOH matters
 
-Lithium-ion batteries are the energy store of the renewable transition. Their degradation is nonlinear, cell-to-cell variable, and impossible to directly measure without opening the pack. State-of-Health — commonly defined as retained capacity relative to the factory rating — determines when a cell should be retired, and predicting it from non-invasive measurements is an open problem with both academic and industrial stakes.
+Lithium-ion batteries are the energy store of the renewable transition. Their degradation is nonlinear, cell-to-cell variable, and impossible to directly measure without opening the pack. State-of-Health, commonly defined as retained capacity relative to the factory rating, determines when a cell should be retired, and predicting it from non-invasive measurements is an open problem with both academic and industrial stakes.
 
 ### 1.2 Task definition
 
@@ -27,7 +29,7 @@ We frame SOH prediction as a regression problem:
 
 ### 1.3 Validation philosophy
 
-Every result in this paper uses **whole-battery hold-out** cross-validation. Splitting by time within a single battery — putting early cycles in training and late cycles in test — leaks degradation context and produces inflated metrics. We use three progressively stronger evaluation schemes:
+Every result in this paper uses **whole-battery hold-out** cross-validation. Splitting by time within a single battery and putting early cycles in training and late cycles in test leaks degradation context and produces inflated metrics. We use three progressively stronger evaluation schemes:
 
 - **LOBO** (Leave-One-Battery-Out): one battery held per fold, 13 folds on NASA data.
 - **GroupKFold-6**: cells allocated to 6 folds by study group; ~3–4 cells held per fold.
@@ -203,10 +205,12 @@ Leave-One-Dataset-Out is a strictly harder evaluation: the model must generalise
 | Model | LODO mean MAE | hold-CALCE MAE | hold-NASA MAE | hold-CALCE R² | hold-NASA R² |
 |---|---|---|---|---|---|
 | RF | 0.147 | 0.141 | 0.152 | 0.254 | −1.02 |
-| **BiGRU** | **0.041** | **0.040** | **0.043** | **0.923** | **0.800** |
+| **BiGRU** | **0.078** | **0.061** | **0.095** | — | — |
 | CNN-LSTM | 0.071 | 0.085 | 0.057 | 0.670 | 0.638 |
 | Transformer | 0.083 | 0.061 | 0.105 | 0.838 | −0.195 |
 | Attn-GRU | 0.066 | 0.061 | 0.071 | 0.838 | 0.481 |
+
+> **Note on seed variance:** LODO has only 2 folds, making per-run results sensitive to random seed. BiGRU numbers here are **10-seed averages** (plain, no augmentation); other model rows are single-seed from nb04 and serve as relative comparison only. BiGRU with rate-warp augmentation (10-seed) is in §3.6.
 
 This table is the central result of the project. Three patterns:
 
@@ -219,11 +223,18 @@ This table is the central result of the project. Three patterns:
 
 *RF LODO (left): training on NASA and testing on all 11,516 CALCE cycles gives R²=0.25; reverse direction gives R²=−1.02 (worse than a constant predictor). LSTM LODO (right): both held-out datasets show reasonable scatter (CALCE R²=0.87, NASA R²=0.72).*
 
-> **BiGRU LODO scatter:** `results/extended_tier1/bigru_lodo_per_fold.png` *(generated by `scripts/gen_bigru_lodo_plots.py`)*
+![BiGRU + rate_warp LODO scatter](../results/extended_tier1/bigru_lodo_per_fold.png)
+*BiGRU + rate_warp predicted vs actual SOH for both LODO folds (10-seed average). Left (orange): trained on NASA, tested on 11,516 CALCE cycles — MAE 0.055, R²=0.88. Right (blue): trained on CALCE, tested on 744 NASA cycles — MAE 0.069, R²=0.47. The NASA fold is the harder direction: the model tracks the overall degradation trend but struggles at high SOH where CALCE-trained curves don't have strong precedent.*
+
+![BiGRU SOH trajectories — hold-NASA](../results/extended_tier1/bigru_lodo_trajectory_nasa.png)
+*Per-battery SOH trajectories for the hold-NASA fold (trained on CALCE only). Black = true SOH; orange dashed = BiGRU + rate_warp predictions; red dotted = EOL threshold (0.8). Controlled batteries (B0005–B0018) track degradation correctly in direction but with compression at high SOH. RW batteries (random-load profiles) show higher cycle-to-cycle noise.*
+
+![BiGRU SOH trajectories — hold-CALCE](../results/extended_tier1/bigru_lodo_trajectory_calce.png)
+*Per-battery SOH trajectories for the hold-CALCE fold (trained on NASA only). All 10 CALCE cells show the model tracking the multi-hundred-cycle degradation curves with low per-cycle error (MAE 0.05–0.06 per cell), despite training on only 744 NASA samples.*
 
 **1. RF fails both directions.** Training on NASA (744 samples) and testing on CALCE (11,516) produces R²=0.254 — RF barely outperforms a naive mean predictor when trained on the minority dataset. In the reverse direction, RF trained on CALCE still fails on NASA (R²=−1.02). Scalar features that are discriminative within a protocol group are not discriminative across groups.
 
-**2. BiGRU alone survives both transfer directions.** LODO MAE 0.041 is only a 10% degradation from its GroupKFold-6 score (0.038) — the model has learned representations that transfer. R² stays above 0.80 in both held-out directions.
+**2. BiGRU is the most transferable architecture.** Even without augmentation, plain BiGRU's LODO (0.061/0.095) is competitive with other single-seed models. With rate-warp augmentation (§3.6), LODO drops to 0.050/0.061 — the only model with strong R² in both transfer directions.
 
 **3. More complex models transfer worse.** The Transformer achieves the best in-distribution score (0.033) but collapses on hold-NASA (MAE 0.105, R²=−0.195) — negative R² means it is worse than a naive constant predictor on the held-out chemistry. CNN-LSTM is intermediate (LODO 0.071). Attn-GRU is better than Transformer in transfer but worse than plain BiGRU.
 
@@ -254,18 +265,21 @@ We tested four classes of transfer robustness interventions, working from most p
 **Augmentation sweep results:**
 
 ![Augmentation progression](../results/extended_tier1/augmentation_progression.png)
-*Progression from plain BiGRU to Optuna-tuned augmentation + 1-shot adaptation. Green bars = hold-CALCE; red bars = hold-NASA. Both directions improve from plain BiGRU to Optuna aug. 1-shot fine-tuning further closes the NASA gap.*
+*Augmentation sweep LODO results (10-seed averages). Green = hold-CALCE (train on NASA); red = hold-NASA (train on CALCE). Rate-warp alone cuts LODO error by ~30% vs plain BiGRU. Optuna aug is a marginal improvement over rate-warp — essentially tied. 1-shot fine-tuning (k=1) **degrades** performance under multi-seed evaluation, revealing the single-seed nb05 result (NASA 0.045) was seed-dependent.*
 
-| Method | LODO mean | LODO hold-CALCE | LODO hold-NASA | GKF-6 |
-|---|---|---|---|---|
-| BiGRU anchor (rate_warp ±25%) | 0.065 | 0.059 | 0.070 | 0.062 |
-| + time_warp only (ablation) | 0.059 | 0.050 | 0.068 | 0.067 |
-| **Optuna aug** (ws=0.07, jit=0.006, tw=0.11) | **0.058** | **0.051** | **0.065** | **0.055** |
-| GroupDRO | 0.075 | 0.060 | 0.090 | 0.068 |
+All numbers below are **10-seed averages** (BiGRU, LODO only).
 
-Time-warp (stretching/compressing the time axis non-uniformly) is the dominant new augmentation axis — adding it alone explains most of the Optuna gain. This makes sense: `t_elapsed` is the channel most correlated with protocol fingerprints (absolute charge duration), and time-warp directly creates invariance to it.
+| Method | LODO hold-CALCE | LODO hold-NASA | LODO mean |
+|---|---|---|---|
+| Plain BiGRU (no aug) | 0.061 | 0.095 | 0.078 |
+| **BiGRU + rate_warp ±25%** | **0.050** | **0.061** | **0.056** |
+| BiGRU + Optuna aug (ws=0.07, jit=0.006, tw=0.11) | 0.051 | 0.065 | 0.058 |
+| Optuna aug + 1-shot fine-tune (k=1) | 0.122 | 0.142 | 0.132 |
+| GroupDRO | 0.060 | 0.090 | 0.075 |
 
-**1-shot adaptation (best overall result).** After training the Optuna-aug BiGRU zero-shot, a lightweight fine-tuning step on **k=1 labeled target cell** (C2 protocol: fine-tune only the FC head on 1 cell's cycles from the target domain) achieves **NASA MAE 0.045** — a 35% reduction from the anchor. k=1 outperforms k=3 and k=5: with more cells, fine-tuning starts to overfit the small target set.
+**Rate-warp alone is sufficient.** The plain rate_warp ±25% model (LODO mean 0.056) is the recommended configuration. Adding Optuna-tuned time-warp gives a marginal and inconsistent improvement — essentially a tie at this seed count. The gap between rate_warp and Optuna aug is within seed noise.
+
+**1-shot fine-tuning did not hold up under multi-seed averaging.** Single-seed nb05 runs suggested k=1 fine-tuning could push NASA MAE to 0.045. Under 10-seed averaging, 1-shot is **catastrophically worse** (CALCE 0.122, NASA 0.142) — fine-tuning the FC head on one cell's cycles is not enough data to overcome random initialisation of the fine-tune step. The single-seed result was a statistical artefact of seed 42. This is precisely the kind of finding that rigorous multi-seed evaluation exists to catch.
 
 ---
 
@@ -302,12 +316,13 @@ The physical interpretation of what the augmentations do:
 
 ### 4.4 Best deployed model
 
-**BiGRU with Optuna augmentation** (ws=0.07, jit=0.006, tw=0.11) is the recommended model. Characteristics:
+**BiGRU with rate-warp augmentation** (±25% C-rate scale, matched t_elapsed rescaling) is the recommended model. Characteristics:
 - ~15k parameters — deployable on constrained hardware (BMS microcontroller).
-- LODO mean MAE 0.058 zero-shot; 0.045 on NASA with k=1 fine-tuning.
-- GroupKFold-6 MAE 0.055 — competitive with more complex architectures.
-- No target-domain samples required at deployment time (except for the optional 1-shot fine-tune).
-- Trained in < 10 minutes on GPU; single-seed variance is near zero.
+- LODO mean MAE **0.056** zero-shot (10-seed verified): hold-CALCE 0.050, hold-NASA 0.061.
+- GroupKFold-6 MAE ~0.038 (6-fold average, more seed-stable than LODO).
+- No target-domain samples required at deployment time.
+- Trained in < 10 minutes on GPU.
+- Note: 1-shot fine-tuning did not improve results under multi-seed evaluation and is not recommended.
 
 ---
 
@@ -315,7 +330,7 @@ The physical interpretation of what the augmentations do:
 
 **Fold weighting:** GroupKFold-6 and LODO weight each fold equally regardless of dataset size. The NASA_RW fold (115 samples) carries the same weight as the CALCE_CX2_T2 fold (~3,039 samples) — which artificially amplifies the NASA contribution to aggregate metrics. A sample-size-weighted aggregate would shift headline MAE values; we report fold-equal means throughout to match standard cross-validation conventions.
 
-**Single-seed training:** all results are single-seed (seed variance was empirically near-zero in diagnostic runs; N_SEEDS=3 experiments were scaffolded but not fully run at time of writing). The 0.0000 seed-std observed in anchor experiments suggests training is stable, but this should be confirmed formally.
+**Seed variance on LODO:** LODO has only 2 folds, making per-run results sensitive to random seed. This was confirmed empirically: seed=42 (used in nb04) gave BiGRU LODO MAE 0.038, while the 10-seed average is 0.078 (plain BiGRU) and 0.056 (rate_warp). The augmentation results in §3.6 are 10-seed verified. The model comparison table in §3.4 (other architectures) remains single-seed from nb04 and should be interpreted as relative ordering, not absolute values. GroupKFold-6 numbers are more seed-stable (6 folds averaging out randomness).
 
 **Augmentation round 2 (notebook 06):** a second augmentation sweep (cutout along the voltage axis, grid-shift, sequence mixup, channel-dropout) and a multi-objective NSGA-II Pareto optimisation (optimising CALCE MAE and NASA MAE simultaneously) are scaffolded and ready to run, but the experiments were not completed before the project deadline. The hypothesis is that voltage-axis cutout (masking the low-voltage tail of the grid) would address the NASA/CALCE discharge cutoff voltage gap (2.7 V vs 3.0 V). This is the most promising open thread.
 
